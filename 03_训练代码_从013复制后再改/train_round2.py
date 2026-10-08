@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
-"""Continue ID03 patch diffusion from checkpoint_epoch200.pt.
+"""Continue ID03 patch diffusion from a checkpoint the user passes.
 
 Round 1 (train_round1.py) stays noise-only. This script does not replace it.
-It loads 04_训练日志/checkpoint_epoch200.pt and trains at most 200 more epochs.
+Pass --checkpoint. The file is not in git; on the server the next run is
+04_训练日志/checkpoint_epoch400.pt. Each invocation trains at most 200 more epochs.
 
 Image-structure terms are the four that training/diffusion.py adds on top of
 the noise loss when it decodes (not the VAE-only SSIM, flatness, or KL terms):
@@ -27,8 +28,11 @@ boundary, and Haar terms are VaeLossWeights in losses.py:
 
   rgb 1.0, edge 0.5, boundary 0.25, haar 0.25
 
-loss.image multiplies a full four-channel L1. The pixel coefficient reused
-here is VaeLossWeights.rgb (1.0). The 0.75/0.25 channel mix inside
+loss.image multiplies a full four-channel L1. VaeLossWeights.rgb is 1.0.
+The epoch-400 samples were still unformed color noise: the logged total stayed
+near 1.2 while the noise term was about 0.06. This continuation raises only
+that full four-channel pixel L1 weight from 1.0 to 4.0. Edge, boundary, and
+Haar stay on VaeLossWeights. The 0.75/0.25 channel mix inside
 boundary_aware_vae_loss is not what diffusion.py applies, so it is not used.
 VaeLossWeights.ssim (0.25), flatness (0.05), and kl (1e-6) are VAE-only.
 simple_vae_loss's edge weight 0.2 is not used either: that path zeros
@@ -50,7 +54,7 @@ weight decay 0.0001, betas (0.9, 0.95), gradient clip 1.0, constant lr.
 train_diffusion also steps a cosine schedule sized for warmup_steps 1500 and
 max_steps 80000. That schedule is the 80000-step run, not a separate
 structure-loss optimizer, so it is not turned on here. Adam moments are
-restored from the epoch-200 checkpoint.
+restored from the checkpoint the user passes.
 """
 from __future__ import annotations
 
@@ -102,7 +106,8 @@ LOSS_OVERLAY = 0.0
 LOSS_ORIENTATION = 0.0
 ROUND1_EPOCHS = 200
 MAX_EXTRA_EPOCHS = 200
-FINAL_EPOCH = ROUND1_EPOCHS + MAX_EXTRA_EPOCHS
+# Existing spot-check folders. A finished run writes a different directory.
+RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮")
 
 
 def _import_structure():
@@ -118,8 +123,9 @@ def _import_structure():
 
 VaeLossWeights, boundary_loss, edge_loss, haar_loss, BoundaryAwareVAE = _import_structure()
 _STRUCTURE_SOURCE = VaeLossWeights()
-# Pixel multiplier is VaeLossWeights.rgb. diffusion.py calls the term loss.image.
-LOSS_IMAGE = float(_STRUCTURE_SOURCE.rgb)
+# diffusion.py calls this term loss.image and applies it to a full four-channel L1.
+# VaeLossWeights.rgb is 1.0. Raised to 4.0 after the epoch-400 windows stayed noise.
+LOSS_IMAGE = 4.0
 LOSS_EDGE = float(_STRUCTURE_SOURCE.edge)
 LOSS_BOUNDARY = float(_STRUCTURE_SOURCE.boundary)
 LOSS_HAAR = float(_STRUCTURE_SOURCE.haar)
@@ -165,20 +171,38 @@ def diffusion_structure_total(
 
 
 def resolve_epoch_range(start_epoch: int, extra_epochs: int) -> tuple[int, int]:
+    """Continue from the epoch stored in the checkpoint the user passed.
+
+    Round 1 ends at epoch 200. Later checkpoints, including epoch 400, are
+    valid starts. One invocation still adds at most 200 epochs.
+    """
     if extra_epochs < 1 or extra_epochs > MAX_EXTRA_EPOCHS:
-        raise RuntimeError("第二轮最多再训 200 轮，不要退回 80000 步")
-    if start_epoch < ROUND1_EPOCHS or start_epoch >= FINAL_EPOCH:
+        raise RuntimeError("这一段最多再训 200 轮，不要退回 80000 步")
+    if start_epoch < ROUND1_EPOCHS:
         raise RuntimeError(
-            f"断点必须是第 {ROUND1_EPOCHS} 轮，或第二轮尚未到第 {FINAL_EPOCH} 轮的断点，实际第 {start_epoch} 轮"
+            f"断点至少要到第 {ROUND1_EPOCHS} 轮，实际第 {start_epoch} 轮。"
+            "把 --checkpoint 指到 checkpoint_epoch200.pt 或更后面的断点。"
         )
-    end_epoch = start_epoch + extra_epochs
-    if end_epoch > FINAL_EPOCH:
-        room = FINAL_EPOCH - start_epoch
-        raise RuntimeError(
-            f"从第 {start_epoch} 轮再加 {extra_epochs} 轮会超过第 {FINAL_EPOCH} 轮。"
-            f"这一段最多还能训 {room} 轮。"
-        )
-    return start_epoch, end_epoch
+    return start_epoch, start_epoch + extra_epochs
+
+
+def writes_checkpoints(smoke: bool) -> bool:
+    return not smoke
+
+
+def writes_id03_images(smoke: bool) -> bool:
+    return not smoke
+
+
+def heldout_sample_dir(log_dir: Path, end_epoch: int) -> Path:
+    """A new folder under the log directory. Does not reuse an existing spot check."""
+    stem = f"ID03抽查_epoch{end_epoch:03d}"
+    candidate = log_dir / stem
+    suffix = 1
+    while candidate.name in RESERVED_SAMPLE_DIRS or candidate.exists():
+        suffix += 1
+        candidate = log_dir / f"{stem}_{suffix}"
+    return candidate
 
 
 def check_batch_size(batch_size: int) -> None:
@@ -202,8 +226,7 @@ def load_frozen_vae(path: Path, device: torch.device):
 def _load_checkpoint(path: Path, device: torch.device) -> dict:
     if not path.is_file():
         raise FileNotFoundError(
-            "找不到断点 "
-            f"{path}。checkpoint_epoch200.pt 不在 git 里，它在服务器的 04_训练日志/ 下面。"
+            f"找不到断点 {path}。断点不在 git 里。把 --checkpoint 指到服务器 04_训练日志/ 下要接着训的那一份。"
         )
     return torch.load(path, map_location=device, weights_only=False)
 
@@ -272,8 +295,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--checkpoint",
         type=Path,
-        default=root / "04_训练日志" / "checkpoint_epoch200.pt",
-        help="Round-1 checkpoint. It is not in git; on the server it is 04_训练日志/checkpoint_epoch200.pt",
+        required=True,
+        help="Checkpoint to resume. Not stored in git. Example: 04_训练日志/checkpoint_epoch400.pt",
     )
     parser.add_argument("--latent-dir", type=Path, default=root / "02_整图潜变量_八个视角")
     parser.add_argument("--crops", type=Path, default=table_dir / "crops.csv")
@@ -288,7 +311,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=MAX_EXTRA_EPOCHS, help="Extra epochs after the loaded checkpoint, at most 200")
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=SEED_BASE)
-    parser.add_argument("--smoke", action="store_true", help="One optimizer step from the checkpoint, then exit without saving")
+    parser.add_argument(
+        "--smoke",
+        action="store_true",
+        help="One optimizer step from the checkpoint, then exit. Writes no checkpoint and no ID03 image",
+    )
     return parser.parse_args()
 
 
@@ -308,6 +335,14 @@ def main() -> None:
     weights = structure_loss_weights()
     if list(weights) != ["image", "edge", "boundary", "haar"]:
         raise RuntimeError(f"结构损失项不对: {list(weights)}")
+    if weights["image"] != 4.0:
+        raise RuntimeError("四通道像素 L1 权重必须是 4.0")
+    if (weights["edge"], weights["boundary"], weights["haar"]) != (
+        float(_STRUCTURE_SOURCE.edge),
+        float(_STRUCTURE_SOURCE.boundary),
+        float(_STRUCTURE_SOURCE.haar),
+    ):
+        raise RuntimeError("边缘、晶界、Haar 必须保持 VaeLossWeights，不能跟着像素项一起改")
     ConditionalLatentUNet, DiffusionSchedule, cosine_beta_schedule = _import_unet()
     probe = cosine_beta_schedule(TRAINING_TIMESTEPS, offset=COSINE_BETA_OFFSET)
     if probe.shape != (TRAINING_TIMESTEPS,):
@@ -363,6 +398,8 @@ def main() -> None:
     _check_optimizer(optimizer)
     step = int(state["step"])
     if args.smoke:
+        if writes_checkpoints(True) or writes_id03_images(True):
+            raise RuntimeError("smoke 不写断点，也不写 ID03 图")
         _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, device, precision, step)
         return
     val_rows = [row for row in read_table(args.val_strip) if row["alloy_id"] != HOLDOUT]
@@ -412,12 +449,18 @@ def main() -> None:
             f"epoch {epoch} train_total {float(np.mean(epoch_total)):.4f} val_noise {val_noise}",
             flush=True,
         )
-        if epoch % 50 == 0 or epoch == end_epoch:
+        if writes_checkpoints(args.smoke) and (epoch % 50 == 0 or epoch == end_epoch):
             save_checkpoint(
                 args.log_dir / f"checkpoint_epoch{epoch:03d}.pt",
                 model, ema, optimizer, epoch, step, cond_values, str(args.checkpoint),
             )
             print(f"saved checkpoint_epoch{epoch:03d}.pt", flush=True)
+    if writes_id03_images(args.smoke):
+        final_checkpoint = args.log_dir / f"checkpoint_epoch{end_epoch:03d}.pt"
+        if not final_checkpoint.is_file():
+            raise RuntimeError(f"训练结束但没有写出 {final_checkpoint.name}")
+        sample_dir = heldout_sample_dir(args.log_dir, end_epoch)
+        write_heldout_samples(final_checkpoint, args.vae, sample_dir, args.seed)
 
 
 def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, device, precision, step):
@@ -459,6 +502,29 @@ def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, con
     return step, row
 
 
+def write_heldout_samples(checkpoint: Path, vae_path: Path, out_dir: Path, seed: int) -> Path:
+    """Same four DDIM windows as sample_id03.py --mode sample.
+
+    Uses the holdout condition row only. Does not read an ID03 image, a BMP, or a PNG.
+    The training pixel target stays the decode of the stored clean latent.
+    """
+    from sample_id03 import GUIDANCE_SCALE, SAMPLING_STEPS, sample_id03 as sample_holdout
+    namespace = argparse.Namespace(
+        checkpoint=checkpoint,
+        vae=vae_path,
+        conditions=project_root() / "01_窗口清单_每个窗口的位置和描述符" / "conditions_ID03_holdout.csv",
+        out_dir=out_dir,
+        count=4,
+        steps=SAMPLING_STEPS,
+        guidance=GUIDANCE_SCALE,
+        seed=seed,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    sample_holdout(namespace, device)
+    print(f"id03_sample_dir={out_dir}", flush=True)
+    return out_dir
+
+
 def _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, device, precision, step) -> None:
     rng = np.random.default_rng([args.seed, int(args.epochs)])
     order = epoch_order(groups, rng, args.batch_size)
@@ -482,7 +548,7 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "round": 2,
         "holdout": HOLDOUT,
         "checkpoint": str(args.checkpoint),
-        "checkpoint_note": "not in git; server path 04_训练日志/checkpoint_epoch200.pt",
+        "checkpoint_note": "passed by the user; not in git. Next server run: 04_训练日志/checkpoint_epoch400.pt",
         "start_epoch": start_epoch,
         "end_epoch": end_epoch,
         "extra_epochs": end_epoch - start_epoch,
@@ -508,7 +574,7 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
         "mechanics_surrogate": "not constructed",
         "loss_weights": structure_loss_weights(),
-        "loss_weight_source": "013代码/src/ebsd_feedback/losses.py VaeLossWeights rgb/edge/boundary/haar",
+        "loss_weight_source": "edge/boundary/haar from losses.py VaeLossWeights; pixel L1 raised from VaeLossWeights.rgb 1.0 to 4.0 after epoch 400",
         "loss_formula_source": "013代码/src/ebsd_feedback/training/diffusion.py image L1, edge_loss, boundary_loss, haar_loss",
         "yaml_not_in_tree": "06_配置文件/03_基础条件扩散.yaml was not copied. diffusion.py reads config.loss.image/edge/boundary/haar and does not literalize them.",
         "vae_terms_not_in_diffusion_total": {

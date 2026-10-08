@@ -32,4 +32,12 @@ python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_
 
 python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch200.pt" --batch-size 8
 
-结构项是 013 扩散训练里的四项，见 013代码/src/ebsd_feedback/training/diffusion.py：像素 L1、边缘、晶界、Haar。权重用 013代码/src/ebsd_feedback/losses.py 里 VaeLossWeights 写明的数字：像素 1.0、边缘 0.5、晶界 0.25、Haar 0.25。03_基础条件扩散.yaml 没有复制进这个目录，扩散脚本里的 config.loss.image/edge/boundary/haar 没有写成数字，所以用的是这份源码里这四项仅有的系数。SSIM 0.25、平坦 0.05、KL 1e-6 只在 VAE 损失里，扩散总损失不加，这一轮不算。描述符、展开描述符、叠加在扩散脚本里的默认权重是 0，这一轮保持 0，不加载描述符头。噪声权重仍是 1。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0，动量从第 200 轮断点接着走。013 另有一套给 80000 步用的余弦学习率，这一折不用。日志写到 04_训练日志/train_round2_loss.csv，不覆盖第一轮的 train_noise_loss.csv。断点仍是每 50 轮一份，文件名 checkpoint_epoch250.pt 起，最后是 checkpoint_epoch400.pt。
+结构项是 013 扩散训练里的四项，见 013代码/src/ebsd_feedback/training/diffusion.py：像素 L1、边缘、晶界、Haar。边缘 0.5、晶界 0.25、Haar 0.25 仍是 013代码/src/ebsd_feedback/losses.py 里 VaeLossWeights 的数字。SSIM、平坦、KL、描述符、展开描述符、叠加不加。噪声权重仍是 1。力学权重仍是 0。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。013 那套给 80000 步用的余弦学习率这一折不用。
+
+像素 L1 先用了 VaeLossWeights.rgb 的 1.0，从第 200 轮训到第 400 轮。留出 ID03 的四张窗口仍是没有晶粒、没有黑晶界的彩色噪声，日志里的 total 大约 1.2，噪声项大约 0.06。下一次只把四通道像素 L1 提到 4.0，其它权重不动。断点由命令传入，代码里不写死一个不在 git 里的文件。服务器上接着用第 400 轮这份。默认再训 200 轮，到第 600 轮。正常结束会按 sample_id03.py 的抽法，把留出 ID03 的窗口写到 04_训练日志 下一个新文件夹，不覆盖 ID03抽查 和 ID03抽查_第二轮，并打印 id03_sample_dir。像素目标仍是已存干净潜变量的解码，不读 BMP/PNG，也不读 ID03 的图。--smoke 只走一步，不写断点，也不写图。
+
+python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch400.pt"
+
+显存不够时一批仍是 8 张，最多再训 200 轮。
+
+python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch400.pt" --batch-size 8

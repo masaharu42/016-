@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import ast
+import inspect
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -38,18 +40,21 @@ class Round2Contract(unittest.TestCase):
         self.assertNotIn("train_round2", source)
         self.assertNotIn("import sample_id03", source)
 
-    def test_round2_reuses_vae_loss_weights_and_keeps_mechanics_off(self):
+    def test_round2_raises_only_pixel_l1_and_keeps_mechanics_off(self):
         source = VaeLossWeights()
-        self.assertEqual(train_round2.LOSS_IMAGE, float(source.rgb))
+        self.assertEqual(float(source.rgb), 1.0)
+        self.assertEqual(train_round2.LOSS_IMAGE, 4.0)
+        self.assertNotEqual(train_round2.LOSS_IMAGE, float(source.rgb))
         self.assertEqual(train_round2.LOSS_EDGE, float(source.edge))
         self.assertEqual(train_round2.LOSS_BOUNDARY, float(source.boundary))
         self.assertEqual(train_round2.LOSS_HAAR, float(source.haar))
         self.assertEqual(train_round2.structure_loss_weights(), {
-            "image": 1.0,
+            "image": 4.0,
             "edge": 0.5,
             "boundary": 0.25,
             "haar": 0.25,
         })
+        self.assertEqual(train_round2.LOSS_NOISE, 1.0)
         self.assertEqual(train_round2.MECHANICS_LOSS_WEIGHT, 0.0)
         self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.0)
         self.assertEqual(train_round2.LOSS_UNROLLED_DESCRIPTOR, 0.0)
@@ -60,7 +65,8 @@ class Round2Contract(unittest.TestCase):
         self.assertEqual(float(source.kl), 1e-6)
         text = (ROOT / "train_round2.py").read_text(encoding="utf-8")
         self.assertNotIn("EbsdMechanicsSurrogate", text)
-        self.assertNotIn("sample_id03", text)
+        self.assertNotIn("ssim_loss(", text)
+        self.assertNotIn("intragranular_flatness_loss(", text)
         self.assertIs(train_round2.edge_loss, edge_loss)
         self.assertIs(train_round2.boundary_loss, boundary_loss)
         self.assertIs(train_round2.haar_loss, haar_loss)
@@ -74,7 +80,7 @@ class Round2Contract(unittest.TestCase):
         total = train_round2.diffusion_structure_total(noise, parts)
         expected = (
             1.0 * noise
-            + 1.0 * parts["image"]
+            + 4.0 * parts["image"]
             + 0.5 * parts["edge"]
             + 0.25 * parts["boundary"]
             + 0.25 * parts["haar"]
@@ -95,8 +101,10 @@ class Round2Contract(unittest.TestCase):
         self.assertGreater(float(latent.grad.abs().sum()), 0.0)
         self.assertTrue(all(parameter.grad is None for parameter in vae.parameters()))
 
-    def test_epoch_cap_stays_200_past_round1(self):
+    def test_epoch_cap_allows_resume_from_400(self):
         self.assertEqual(train_round2.resolve_epoch_range(200, 200), (200, 400))
+        self.assertEqual(train_round2.resolve_epoch_range(400, 200), (400, 600))
+        self.assertEqual(train_round2.resolve_epoch_range(400, 1), (400, 401))
         self.assertEqual(train_round2.resolve_epoch_range(250, 150), (250, 400))
         self.assertEqual(train_round2.resolve_epoch_range(200, 1), (200, 201))
         with self.assertRaises(RuntimeError):
@@ -104,9 +112,7 @@ class Round2Contract(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             train_round2.resolve_epoch_range(199, 1)
         with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(400, 1)
-        with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(250, 151)
+            train_round2.resolve_epoch_range(400, 201)
         train_round2.check_batch_size(16)
         train_round2.check_batch_size(8)
         with self.assertRaises(RuntimeError):
@@ -131,6 +137,49 @@ print(_image_mode())
             )
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout.strip().splitlines(), ["IPF_GB", "IPF_GB"])
+
+    def test_pixel_target_is_clean_latent_decode(self):
+        source = inspect.getsource(train_round2._optimizer_step)
+        self.assertIn("vae.decode(latent / LATENT_SCALE)", source)
+        self.assertNotIn("Image.open", source)
+        self.assertNotIn(".bmp", source)
+        self.assertNotIn(".png", source)
+        self.assertNotIn("ID03", source)
+
+    def test_sample_dir_does_not_overwrite_existing_spot_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            log_dir = Path(tmp)
+            (log_dir / "ID03抽查").mkdir()
+            (log_dir / "ID03抽查_第二轮").mkdir()
+            first = train_round2.heldout_sample_dir(log_dir, 600)
+            self.assertEqual(first.name, "ID03抽查_epoch600")
+            self.assertFalse(first.exists())
+            first.mkdir()
+            second = train_round2.heldout_sample_dir(log_dir, 600)
+            self.assertNotEqual(second, first)
+            self.assertFalse(second.exists())
+            self.assertNotIn(second.name, train_round2.RESERVED_SAMPLE_DIRS)
+
+    def test_smoke_writes_neither_checkpoints_nor_images(self):
+        self.assertFalse(train_round2.writes_checkpoints(True))
+        self.assertFalse(train_round2.writes_id03_images(True))
+        self.assertTrue(train_round2.writes_checkpoints(False))
+        self.assertTrue(train_round2.writes_id03_images(False))
+        smoke = inspect.getsource(train_round2._smoke_step)
+        self.assertNotIn("save_checkpoint", smoke)
+        self.assertNotIn("write_heldout_samples", smoke)
+        self.assertNotIn("sample_id03", smoke)
+        main = inspect.getsource(train_round2.main)
+        smoke_at = main.index("if args.smoke:")
+        sample_at = main.index("write_heldout_samples")
+        self.assertLess(smoke_at, sample_at)
+        self.assertIn("return", main[smoke_at:sample_at])
+
+    def test_checkpoint_argument_is_required(self):
+        parser_source = inspect.getsource(train_round2.parse_args)
+        self.assertIn("required=True", parser_source)
+        self.assertNotIn("checkpoint_epoch200.pt", parser_source.split("help=")[0])
+        self.assertNotIn("checkpoint_epoch400.pt", parser_source.split("help=")[0])
 
     def test_round2_module_does_not_rewrite_round1_ast(self):
         round1_tree = ast.parse((ROOT / "train_round1.py").read_text(encoding="utf-8"))
