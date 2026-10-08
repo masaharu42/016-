@@ -28,13 +28,17 @@ python "03_训练代码_从013复制后再改/sample_id03.py" --mode sample --ch
 
 从第 200 轮把潜变量再解码一次当像素目标、每个时间步都加结构损失，训到第 400 轮，四张留出窗口仍是彩色噪声。接着从 checkpoint_epoch400.pt 把像素 L1 提到 4.0，训到第 600 轮，四张窗口仍是彩色噪声，没有晶粒，也没有黑晶界。这两份断点不要再接着训，权重也不要再加大。
 
-下一次仍从第一轮噪声断点开始。命令里传入 --checkpoint，服务器上是 04_训练日志/checkpoint_epoch200.pt。不要传 checkpoint_epoch400.pt 或 checkpoint_epoch600.pt。默认再训 200 轮，到第 400 轮，一批 16 张，bf16。力学权重仍是 0，不加载力学代理。如果提示没有 pandas，先再执行一次开头的 pip。train_round2.py 用 013 的 image_to_tensor 读窗口原图，那个文件会 import pandas。
+从第 200 轮用原图、只在低噪声步加结构损失，训到第 400 轮，四张留出窗口仍是彩色噪声，没有晶粒，也没有黑晶界。损失项和权重保持不动，把这一次加长到大约 20000 个优化步。仍从 04_训练日志/checkpoint_epoch200.pt 开始。不要传 checkpoint_epoch400.pt 或 checkpoint_epoch600.pt。一次运行的优化步不能超过 20000，也不要退回 80000 步。力学权重仍是 0，不加载力学代理。如果提示没有 pandas，先再执行一次开头的 pip。train_round2.py 用 013 的 image_to_tensor 读窗口原图，那个文件会 import pandas。
+
+一批 16 张时，一轮 21 步，默认 952 轮，19992 个优化步，从第 200 轮训到第 1152 轮。
 
 python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch200.pt"
 
-显存不够时改成一批 8 张。一轮变成 42 步，仍然最多再训 200 轮，不要改回 80000 步。
+显存不够时一批 8 张。一轮 42 步，默认 476 轮，同样 19992 个优化步，从第 200 轮训到第 676 轮。
 
 python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch200.pt" --batch-size 8
+
+每一轮结束都立刻在终端打印 train_total、noise、image、edge、boundary、haar 和 val_noise，并刷新输出。损失仍写入 04_训练日志/train_round2_原图低噪声.csv。因为这次又从第 200 轮重开，这个 csv 会从头写。正常结束仍把留出 ID03 的窗口写到新文件夹，打印 id03_sample_dir，不覆盖 ID03抽查、ID03抽查_第二轮、ID03抽查_epoch600。--smoke 只走一步，不写断点，也不写图。
 
 结构项仍是 013 扩散训练里的四项，见 013代码/src/ebsd_feedback/training/diffusion.py：像素 L1、边缘、晶界、Haar。像素 L1 回到 losses.py 里 VaeLossWeights.rgb 的 1.0。边缘 0.5、晶界 0.25、Haar 0.25 仍是同一处的数字。噪声权重仍是 1，每一步都算。SSIM、平坦、KL、描述符、展开描述符、叠加不加。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。013 那套给 80000 步用的余弦学习率这一折不用。
 

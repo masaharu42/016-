@@ -4,7 +4,11 @@
 Round 1 (train_round1.py) stays noise-only. This script does not replace it.
 Pass --checkpoint. On the server that file is 04_训练日志/checkpoint_epoch200.pt.
 Do not resume checkpoint_epoch400.pt or checkpoint_epoch600.pt.
-Each invocation trains at most 200 more epochs.
+Each invocation does about 20000 optimizer steps and cannot pass that target.
+It does not return to the 80000-step schedule. Batch 16 draws 21 steps per
+epoch, so the default is 952 epochs (19992 steps) and ends at epoch 1152.
+Batch 8 draws 42 steps per epoch, so the default is 476 epochs (19992 steps)
+and ends at epoch 676. Every epoch prints the total and each term, flushed.
 
 Image-structure terms are the four that training/diffusion.py adds on top of
 the noise loss when it decodes (not the VAE-only SSIM, flatness, or KL terms):
@@ -113,7 +117,10 @@ LOSS_UNROLLED_DESCRIPTOR = 0.0
 LOSS_OVERLAY = 0.0
 LOSS_ORIENTATION = 0.0
 ROUND1_EPOCHS = 200
-MAX_EXTRA_EPOCHS = 200
+# One invocation from the round-1 checkpoint. Whole epochs stay at or under this.
+TARGET_OPTIMIZER_STEPS = 20000
+# 013 sizes train_diffusion for max_steps 80000. This fold does not use that length.
+UNUSED_LONG_RUN_STEPS = 80000
 FORBIDDEN_START_EPOCHS = (400, 600)
 FORBIDDEN_CHECKPOINT_NAMES = ("checkpoint_epoch400.pt", "checkpoint_epoch600.pt")
 # diffusion.py: getattr(config.loss, "descriptor_low_noise_fraction", 0.3)
@@ -243,10 +250,40 @@ def diffusion_structure_total(
     )
 
 
-def resolve_epoch_range(start_epoch: int, extra_epochs: int) -> tuple[int, int]:
-    """Start at the round-1 noise checkpoint and add at most 200 epochs."""
-    if extra_epochs < 1 or extra_epochs > MAX_EXTRA_EPOCHS:
-        raise RuntimeError("这一段最多再训 200 轮，不要退回 80000 步")
+def optimizer_steps_per_epoch(batch_size: int) -> int:
+    check_batch_size(batch_size)
+    windows = N_ALLOYS * DRAWS_PER_ALLOY
+    if windows % batch_size != 0:
+        raise RuntimeError(f"一轮 {windows} 个窗口不能被 batch {batch_size} 整除")
+    return windows // batch_size
+
+
+def default_extra_epochs(batch_size: int) -> int:
+    """Largest whole epoch count whose optimizer steps stay within the target."""
+    per_epoch = optimizer_steps_per_epoch(batch_size)
+    epochs = TARGET_OPTIMIZER_STEPS // per_epoch
+    if epochs < 1 or epochs * per_epoch > TARGET_OPTIMIZER_STEPS:
+        raise RuntimeError(f"无法把 {TARGET_OPTIMIZER_STEPS} 步排成完整的轮")
+    return epochs
+
+
+def resolve_epoch_range(start_epoch: int, extra_epochs: int, batch_size: int) -> tuple[int, int]:
+    """Start at the round-1 noise checkpoint. One invocation stays within 20000 steps."""
+    per_epoch = optimizer_steps_per_epoch(batch_size)
+    if extra_epochs < 1:
+        raise RuntimeError("至少再训 1 轮")
+    extra_steps = extra_epochs * per_epoch
+    if (
+        extra_steps > TARGET_OPTIMIZER_STEPS
+        or extra_steps >= UNUSED_LONG_RUN_STEPS
+        or extra_epochs >= UNUSED_LONG_RUN_STEPS
+    ):
+        cap_epochs = TARGET_OPTIMIZER_STEPS // per_epoch
+        raise RuntimeError(
+            f"这一次最多 {TARGET_OPTIMIZER_STEPS} 个优化步。"
+            f"一批 {batch_size} 时每轮 {per_epoch} 步，最多 {cap_epochs} 轮"
+            f"（{cap_epochs * per_epoch} 步）。不要退回 {UNUSED_LONG_RUN_STEPS} 步。"
+        )
     if start_epoch in FORBIDDEN_START_EPOCHS:
         raise RuntimeError(
             "不要从第 400 轮或第 600 轮继续。把 --checkpoint 指到第一轮噪声断点，第 200 轮。"
@@ -400,7 +437,12 @@ def parse_args() -> argparse.Namespace:
         default=root / "07_013各折已有权重" / "ID03" / "01_边界感知VAE" / "VAE_最终模型.pt",
     )
     parser.add_argument("--log-dir", type=Path, default=root / "04_训练日志")
-    parser.add_argument("--epochs", type=int, default=MAX_EXTRA_EPOCHS, help="Extra epochs after the loaded checkpoint, at most 200")
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=None,
+        help="Extra epochs after the round-1 checkpoint. Default is the largest whole epoch count within 20000 optimizer steps. A single run cannot pass that target or return to 80000 steps.",
+    )
     parser.add_argument("--batch-size", type=int, default=16)
     parser.add_argument("--seed", type=int, default=SEED_BASE)
     parser.add_argument(
@@ -417,13 +459,39 @@ def _autocast(precision: str):
     return _null()
 
 
+def enable_live_stdout() -> None:
+    """Line-buffer the terminal so each epoch line shows up as it is printed."""
+    stream = sys.stdout
+    if hasattr(stream, "reconfigure"):
+        try:
+            stream.reconfigure(line_buffering=True)
+        except (OSError, ValueError):
+            return
+
+
+def format_epoch_line(epoch: int, rows: list[dict[str, str]], val_noise: str) -> str:
+    if not rows:
+        raise RuntimeError("这一轮没有优化步，不能打印损失")
+
+    def mean(key: str) -> float:
+        return float(np.mean([float(row[key]) for row in rows]))
+
+    return (
+        f"epoch {epoch} train_total {mean('loss_total'):.4f} "
+        f"noise {mean('loss_noise'):.4f} image {mean('loss_image'):.4f} "
+        f"edge {mean('loss_edge'):.4f} boundary {mean('loss_boundary'):.4f} "
+        f"haar {mean('loss_haar'):.4f} val_noise {val_noise}"
+    )
+
+
 def main() -> None:
+    enable_live_stdout()
     args = parse_args()
     if MECHANICS_LOSS_WEIGHT != 0.0:
         raise RuntimeError("第二轮 MECHANICS_LOSS_WEIGHT 必须是 0。")
     check_batch_size(args.batch_size)
-    if args.epochs > MAX_EXTRA_EPOCHS:
-        raise RuntimeError("第二轮最多再训 200 轮，不要退回 80000 步")
+    if args.epochs is None:
+        args.epochs = default_extra_epochs(args.batch_size)
     weights = structure_loss_weights()
     if list(weights) != ["image", "edge", "boundary", "haar"]:
         raise RuntimeError(f"结构损失项不对: {list(weights)}")
@@ -454,7 +522,9 @@ def main() -> None:
     state = _load_checkpoint(args.checkpoint, device)
     start_epoch = int(state["epoch"])
     assert_round1_checkpoint(args.checkpoint, start_epoch)
-    start_epoch, end_epoch = resolve_epoch_range(start_epoch, args.epochs)
+    start_epoch, end_epoch = resolve_epoch_range(start_epoch, args.epochs, args.batch_size)
+    per_epoch = optimizer_steps_per_epoch(args.batch_size)
+    planned_steps = (end_epoch - start_epoch) * per_epoch
     if float(state.get("mechanics_loss_weight", 0.0)) != 0.0:
         raise RuntimeError("载入的断点 mechanics_loss_weight 不是 0")
     if abs(float(state.get("latent_scale", LATENT_SCALE)) - LATENT_SCALE) > 1e-12:
@@ -465,7 +535,9 @@ def main() -> None:
         raise RuntimeError("断点里的条件均值和 conditions.csv 不一致")
     print(
         f"device={device.type} precision={precision} batch={args.batch_size} "
-        f"resume_epoch={start_epoch} through_epoch={end_epoch} checkpoint={args.checkpoint} "
+        f"resume_epoch={start_epoch} through_epoch={end_epoch} "
+        f"steps_per_epoch={per_epoch} optimizer_steps={planned_steps} step_cap={TARGET_OPTIMIZER_STEPS} "
+        f"checkpoint={args.checkpoint} "
         f"lr={LEARNING_RATE} betas={ADAMW_BETAS} "
         f"loss_image={LOSS_IMAGE} loss_edge={LOSS_EDGE} loss_boundary={LOSS_BOUNDARY} loss_haar={LOSS_HAAR} "
         f"low_noise_fraction={LOW_NOISE_FRACTION} window_dir={args.window_dir} "
@@ -501,10 +573,10 @@ def main() -> None:
     val_rows = [row for row in read_table(args.val_strip) if row["alloy_id"] != HOLDOUT]
     if not val_rows:
         raise RuntimeError("val_strip.csv 没有训练合金的右侧窗口")
-    steps_per_epoch = (N_ALLOYS * DRAWS_PER_ALLOY) // args.batch_size
+    steps_per_epoch = per_epoch
     print(
         f"steps_per_epoch={steps_per_epoch} extra_epochs={end_epoch - start_epoch} "
-        f"resume_step={step}",
+        f"optimizer_steps={planned_steps} step_cap={TARGET_OPTIMIZER_STEPS} resume_step={step}",
         flush=True,
     )
     args.log_dir.mkdir(parents=True, exist_ok=True)
@@ -525,26 +597,23 @@ def main() -> None:
         rng = np.random.default_rng([args.seed, epoch])
         order = epoch_order(groups, rng, args.batch_size)
         model.train()
-        epoch_total = []
+        epoch_rows = []
+        val_noise = ""
         for start in range(0, len(order), args.batch_size):
             batch_rows = [crops[int(i)] for i in order[start:start + args.batch_size]]
             step, row = _optimizer_step(
                 model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, args.window_dir, device, precision, step,
             )
-            epoch_total.append(float(row["loss_total"]))
             is_last = start + args.batch_size >= len(order)
-            val_noise = ""
             if is_last:
                 val_noise = f"{_val_noise(model, schedule, store, val_rows, cond_map, device, args.batch_size):.8f}"
                 model.train()
             row["epoch"] = epoch
             row["val_noise"] = val_noise
+            epoch_rows.append(row)
             with log_path.open("a", newline="", encoding="utf-8") as handle:
                 csv.DictWriter(handle, fieldnames=fields).writerow(row)
-        print(
-            f"epoch {epoch} train_total {float(np.mean(epoch_total)):.4f} val_noise {val_noise}",
-            flush=True,
-        )
+        print(format_epoch_line(epoch, epoch_rows, val_noise), flush=True)
         if writes_checkpoints(args.smoke) and (epoch % 50 == 0 or epoch == end_epoch):
             save_checkpoint(
                 args.log_dir / f"checkpoint_epoch{epoch:03d}.pt",
@@ -652,7 +721,10 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "start_epoch": start_epoch,
         "end_epoch": end_epoch,
         "extra_epochs": end_epoch - start_epoch,
-        "extra_epochs_cap": MAX_EXTRA_EPOCHS,
+        "target_optimizer_steps": TARGET_OPTIMIZER_STEPS,
+        "optimizer_steps": (end_epoch - start_epoch) * steps_per_epoch,
+        "step_cap": TARGET_OPTIMIZER_STEPS,
+        "unused_80000_step_schedule": UNUSED_LONG_RUN_STEPS,
         "batch_size": args.batch_size,
         "steps_per_epoch": steps_per_epoch,
         "learning_rate": LEARNING_RATE,

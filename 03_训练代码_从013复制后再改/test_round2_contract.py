@@ -105,14 +105,33 @@ class Round2Contract(unittest.TestCase):
         self.assertTrue(all(parameter.grad is None for parameter in vae.parameters()))
 
     def test_epoch_cap_resumes_only_from_round1(self):
-        self.assertEqual(train_round2.resolve_epoch_range(200, 200), (200, 400))
-        self.assertEqual(train_round2.resolve_epoch_range(200, 1), (200, 201))
+        self.assertEqual(train_round2.TARGET_OPTIMIZER_STEPS, 20000)
+        self.assertEqual(train_round2.UNUSED_LONG_RUN_STEPS, 80000)
+        self.assertEqual(train_round2.optimizer_steps_per_epoch(16), 21)
+        self.assertEqual(train_round2.optimizer_steps_per_epoch(8), 42)
+        self.assertEqual(train_round2.default_extra_epochs(16), 952)
+        self.assertEqual(train_round2.default_extra_epochs(8), 476)
+        self.assertEqual(952 * 21, 19992)
+        self.assertEqual(476 * 42, 19992)
+        self.assertLessEqual(952 * 21, 20000)
+        self.assertLessEqual(476 * 42, 20000)
+        self.assertGreater(953 * 21, 20000)
+        self.assertGreater(477 * 42, 20000)
+        self.assertEqual(train_round2.resolve_epoch_range(200, 952, 16), (200, 1152))
+        self.assertEqual(train_round2.resolve_epoch_range(200, 476, 8), (200, 676))
+        self.assertEqual(train_round2.resolve_epoch_range(200, 1, 16), (200, 201))
         train_round2.assert_round1_checkpoint(Path("checkpoint_epoch200.pt"), 200)
         for start in (199, 250, 400, 600):
             with self.assertRaises(RuntimeError):
-                train_round2.resolve_epoch_range(start, 1)
+                train_round2.resolve_epoch_range(start, 1, 16)
         with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(200, 201)
+            train_round2.resolve_epoch_range(200, 953, 16)
+        with self.assertRaises(RuntimeError):
+            train_round2.resolve_epoch_range(200, 477, 8)
+        with self.assertRaises(RuntimeError):
+            train_round2.resolve_epoch_range(200, 80000, 16)
+        with self.assertRaises(RuntimeError):
+            train_round2.resolve_epoch_range(200, 0, 16)
         with self.assertRaises(RuntimeError):
             train_round2.assert_round1_checkpoint(Path("checkpoint_epoch400.pt"), 400)
         with self.assertRaises(RuntimeError):
@@ -123,6 +142,42 @@ class Round2Contract(unittest.TestCase):
         train_round2.check_batch_size(8)
         with self.assertRaises(RuntimeError):
             train_round2.check_batch_size(32)
+        parser_source = inspect.getsource(train_round2.parse_args)
+        self.assertIn("default=None", parser_source)
+        self.assertNotIn("MAX_EXTRA_EPOCHS", (ROOT / "train_round2.py").read_text(encoding="utf-8"))
+
+    def test_epoch_line_prints_every_term_flushed(self):
+        rows = [
+            {
+                "loss_total": "1.5",
+                "loss_noise": "0.2",
+                "loss_image": "0.4",
+                "loss_edge": "0.3",
+                "loss_boundary": "0.2",
+                "loss_haar": "0.1",
+            },
+            {
+                "loss_total": "0.5",
+                "loss_noise": "0.0",
+                "loss_image": "0.2",
+                "loss_edge": "0.1",
+                "loss_boundary": "0.0",
+                "loss_haar": "0.1",
+            },
+        ]
+        line = train_round2.format_epoch_line(201, rows, "0.12345678")
+        self.assertEqual(
+            line,
+            "epoch 201 train_total 1.0000 noise 0.1000 image 0.3000 "
+            "edge 0.2000 boundary 0.1000 haar 0.1000 val_noise 0.12345678",
+        )
+        main = inspect.getsource(train_round2.main)
+        self.assertIn("enable_live_stdout()", main)
+        self.assertIn("print(format_epoch_line(epoch, epoch_rows, val_noise), flush=True)", main)
+        self.assertLess(main.index("enable_live_stdout()"), main.index("for epoch in range"))
+        csv_at = main.index("csv.DictWriter")
+        print_at = main.index("format_epoch_line")
+        self.assertLess(csv_at, print_at)
 
     def test_paths_ignore_sample_and_memorization_modes(self):
         script = r"""
