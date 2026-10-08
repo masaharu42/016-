@@ -10,7 +10,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import numpy as np
 import torch
+from PIL import Image
 
 ROOT = Path(__file__).resolve().parent
 PKG = ROOT / "013代码" / "src"
@@ -40,16 +42,17 @@ class Round2Contract(unittest.TestCase):
         self.assertNotIn("train_round2", source)
         self.assertNotIn("import sample_id03", source)
 
-    def test_round2_raises_only_pixel_l1_and_keeps_mechanics_off(self):
+    def test_round2_uses_vae_pixel_weight_and_keeps_mechanics_off(self):
         source = VaeLossWeights()
         self.assertEqual(float(source.rgb), 1.0)
-        self.assertEqual(train_round2.LOSS_IMAGE, 4.0)
-        self.assertNotEqual(train_round2.LOSS_IMAGE, float(source.rgb))
+        self.assertEqual(train_round2.LOSS_IMAGE, 1.0)
+        self.assertEqual(train_round2.LOSS_IMAGE, float(source.rgb))
+        self.assertNotEqual(train_round2.LOSS_IMAGE, 4.0)
         self.assertEqual(train_round2.LOSS_EDGE, float(source.edge))
         self.assertEqual(train_round2.LOSS_BOUNDARY, float(source.boundary))
         self.assertEqual(train_round2.LOSS_HAAR, float(source.haar))
         self.assertEqual(train_round2.structure_loss_weights(), {
-            "image": 4.0,
+            "image": 1.0,
             "edge": 0.5,
             "boundary": 0.25,
             "haar": 0.25,
@@ -80,7 +83,7 @@ class Round2Contract(unittest.TestCase):
         total = train_round2.diffusion_structure_total(noise, parts)
         expected = (
             1.0 * noise
-            + 4.0 * parts["image"]
+            + 1.0 * parts["image"]
             + 0.5 * parts["edge"]
             + 0.25 * parts["boundary"]
             + 0.25 * parts["haar"]
@@ -101,18 +104,21 @@ class Round2Contract(unittest.TestCase):
         self.assertGreater(float(latent.grad.abs().sum()), 0.0)
         self.assertTrue(all(parameter.grad is None for parameter in vae.parameters()))
 
-    def test_epoch_cap_allows_resume_from_400(self):
+    def test_epoch_cap_resumes_only_from_round1(self):
         self.assertEqual(train_round2.resolve_epoch_range(200, 200), (200, 400))
-        self.assertEqual(train_round2.resolve_epoch_range(400, 200), (400, 600))
-        self.assertEqual(train_round2.resolve_epoch_range(400, 1), (400, 401))
-        self.assertEqual(train_round2.resolve_epoch_range(250, 150), (250, 400))
         self.assertEqual(train_round2.resolve_epoch_range(200, 1), (200, 201))
+        train_round2.assert_round1_checkpoint(Path("checkpoint_epoch200.pt"), 200)
+        for start in (199, 250, 400, 600):
+            with self.assertRaises(RuntimeError):
+                train_round2.resolve_epoch_range(start, 1)
         with self.assertRaises(RuntimeError):
             train_round2.resolve_epoch_range(200, 201)
         with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(199, 1)
+            train_round2.assert_round1_checkpoint(Path("checkpoint_epoch400.pt"), 400)
         with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(400, 201)
+            train_round2.assert_round1_checkpoint(Path("checkpoint_epoch600.pt"), 600)
+        with self.assertRaises(RuntimeError):
+            train_round2.assert_round1_checkpoint(Path("checkpoint_epoch250.pt"), 250)
         train_round2.check_batch_size(16)
         train_round2.check_batch_size(8)
         with self.assertRaises(RuntimeError):
@@ -138,27 +144,97 @@ print(_image_mode())
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertEqual(completed.stdout.strip().splitlines(), ["IPF_GB", "IPF_GB"])
 
-    def test_pixel_target_is_clean_latent_decode(self):
+    def test_low_noise_gate_keeps_noise_loss(self):
+        self.assertEqual(train_round2.LOW_NOISE_FRACTION, 0.3)
+        diffusion = (PKG / "ebsd_feedback" / "training" / "diffusion.py").read_text(encoding="utf-8")
+        self.assertIn('descriptor_low_noise_fraction", 0.3', diffusion)
+        timesteps = torch.tensor([10, 299, 300, 900])
+        mask = train_round2.low_noise_mask(timesteps, 1000, 0.3)
+        self.assertEqual(mask.tolist(), [True, True, False, False])
+        self.assertEqual(int(1000 * 0.3), 300)
+        decoded = torch.zeros(4, 4, 16, 16, requires_grad=True)
+        target = torch.ones(4, 4, 16, 16)
+        parts = train_round2.structure_losses_for_timesteps(decoded, target, timesteps, 1000)
+        total = train_round2.diffusion_structure_total(torch.tensor(0.2), parts)
+        total.backward()
+        self.assertIsNotNone(decoded.grad)
+        self.assertGreater(float(decoded.grad[0].abs().sum()), 0.0)
+        self.assertGreater(float(decoded.grad[1].abs().sum()), 0.0)
+        self.assertEqual(float(decoded.grad[2].abs().sum()), 0.0)
+        self.assertEqual(float(decoded.grad[3].abs().sum()), 0.0)
+        high = torch.tensor([300, 900])
+        quiet = torch.rand(2, 4, 16, 16, requires_grad=True)
+        quiet_parts = train_round2.structure_losses_for_timesteps(quiet, torch.rand_like(quiet), high, 1000)
+        noise = torch.tensor(0.4)
+        quiet_total = train_round2.diffusion_structure_total(noise, quiet_parts)
+        self.assertTrue(torch.allclose(quiet_total, noise))
+        for name in ("image", "edge", "boundary", "haar"):
+            self.assertEqual(float(quiet_parts[name].detach()), 0.0)
+
+    def test_pixel_target_is_original_window(self):
         source = inspect.getsource(train_round2._optimizer_step)
-        self.assertIn("vae.decode(latent / LATENT_SCALE)", source)
-        self.assertNotIn("Image.open", source)
+        self.assertIn("low_noise_mask", source)
+        self.assertIn("load_original_batch", source)
+        self.assertIn("vae.decode(predicted_clean[active] / LATENT_SCALE)", source)
+        self.assertNotIn("vae.decode(latent", source)
         self.assertNotIn(".bmp", source)
-        self.assertNotIn(".png", source)
         self.assertNotIn("ID03", source)
+        loader = inspect.getsource(train_round2.load_original_window)
+        self.assertIn("image_to_tensor", loader)
+        self.assertIn("Image.open", loader)
+        main = inspect.getsource(train_round2.main)
+        self.assertIn("assert_round1_checkpoint", main)
+        self.assertNotIn("train_round2_loss.csv", main)
+        self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_loss.csv")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            alloy_dir = root / "ID01"
+            alloy_dir.mkdir()
+            rgb = np.zeros((256, 256, 3), dtype=np.uint8)
+            rgb[:128] = 255
+            rgb[128, 0] = 50
+            rgb[128, 1] = 51
+            Image.fromarray(rgb, mode="RGB").save(alloy_dir / "ID01_v0_rot0_y0_x64.png")
+            row = {"alloy_id": "ID01", "view": "v0_rot0", "pixel_y": "0", "pixel_x": "64"}
+            path = train_round2.window_png_path(root, row)
+            self.assertEqual(path, alloy_dir / "ID01_v0_rot0_y0_x64.png")
+            tensor = train_round2.load_original_window(path)
+            self.assertEqual(tuple(tensor.shape), (4, 256, 256))
+            self.assertTrue(torch.allclose(tensor[:3, 0, 0], torch.ones(3)))
+            self.assertEqual(float(tensor[3, 0, 0]), 1.0)
+            self.assertTrue(torch.allclose(tensor[:3, 200, 0], -torch.ones(3)))
+            self.assertEqual(float(tensor[3, 200, 0]), -1.0)
+            self.assertAlmostEqual(float(tensor[0, 128, 0]), 50 / 127.5 - 1.0, places=5)
+            self.assertEqual(float(tensor[3, 128, 0]), -1.0)
+            self.assertAlmostEqual(float(tensor[0, 128, 1]), 51 / 127.5 - 1.0, places=5)
+            self.assertEqual(float(tensor[3, 128, 1]), 1.0)
+            batch = train_round2.load_original_batch(root, [row])
+            self.assertEqual(tuple(batch.shape), (1, 4, 256, 256))
+            with self.assertRaises(RuntimeError):
+                train_round2.window_png_path(root, {**row, "alloy_id": "ID03"})
+            with self.assertRaises(RuntimeError):
+                train_round2.load_original_window(root / "ID03" / "ID03_v0_rot0_y0_x0.png")
 
     def test_sample_dir_does_not_overwrite_existing_spot_checks(self):
         with tempfile.TemporaryDirectory() as tmp:
             log_dir = Path(tmp)
+            fresh = train_round2.heldout_sample_dir(log_dir, 400)
+            self.assertEqual(fresh.name, "ID03抽查_epoch400")
+            blocked = train_round2.heldout_sample_dir(log_dir, 600)
+            self.assertEqual(blocked.name, "ID03抽查_epoch600_1")
+            self.assertFalse(blocked.exists())
+            for name in train_round2.RESERVED_SAMPLE_DIRS:
+                self.assertIn(name, ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600"))
+                self.assertNotEqual(fresh.name, name)
+                self.assertNotEqual(blocked.name, name)
             (log_dir / "ID03抽查").mkdir()
             (log_dir / "ID03抽查_第二轮").mkdir()
-            first = train_round2.heldout_sample_dir(log_dir, 600)
-            self.assertEqual(first.name, "ID03抽查_epoch600")
-            self.assertFalse(first.exists())
-            first.mkdir()
-            second = train_round2.heldout_sample_dir(log_dir, 600)
-            self.assertNotEqual(second, first)
-            self.assertFalse(second.exists())
-            self.assertNotIn(second.name, train_round2.RESERVED_SAMPLE_DIRS)
+            (log_dir / "ID03抽查_epoch600").mkdir()
+            fresh.mkdir()
+            again = train_round2.heldout_sample_dir(log_dir, 400)
+            self.assertEqual(again.name, "ID03抽查_epoch400_1")
+            self.assertFalse(again.exists())
+            self.assertNotIn(again.name, train_round2.RESERVED_SAMPLE_DIRS)
 
     def test_smoke_writes_neither_checkpoints_nor_images(self):
         self.assertFalse(train_round2.writes_checkpoints(True))

@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
-"""Continue ID03 patch diffusion from a checkpoint the user passes.
+"""Continue ID03 patch diffusion from the round-1 noise checkpoint the user passes.
 
 Round 1 (train_round1.py) stays noise-only. This script does not replace it.
-Pass --checkpoint. The file is not in git; on the server the next run is
-04_训练日志/checkpoint_epoch400.pt. Each invocation trains at most 200 more epochs.
+Pass --checkpoint. On the server that file is 04_训练日志/checkpoint_epoch200.pt.
+Do not resume checkpoint_epoch400.pt or checkpoint_epoch600.pt.
+Each invocation trains at most 200 more epochs.
 
 Image-structure terms are the four that training/diffusion.py adds on top of
 the noise loss when it decodes (not the VAE-only SSIM, flatness, or KL terms):
@@ -28,12 +29,10 @@ boundary, and Haar terms are VaeLossWeights in losses.py:
 
   rgb 1.0, edge 0.5, boundary 0.25, haar 0.25
 
-loss.image multiplies a full four-channel L1. VaeLossWeights.rgb is 1.0.
-The epoch-400 samples were still unformed color noise: the logged total stayed
-near 1.2 while the noise term was about 0.06. This continuation raises only
-that full four-channel pixel L1 weight from 1.0 to 4.0. Edge, boundary, and
-Haar stay on VaeLossWeights. The 0.75/0.25 channel mix inside
-boundary_aware_vae_loss is not what diffusion.py applies, so it is not used.
+loss.image multiplies a full four-channel L1. The pixel weight is
+VaeLossWeights.rgb (1.0). Edge, boundary, and Haar stay on VaeLossWeights.
+The 0.75/0.25 channel mix inside boundary_aware_vae_loss is not what
+diffusion.py applies, so it is not used. The pixel weight is not 4.0.
 VaeLossWeights.ssim (0.25), flatness (0.05), and kl (1e-6) are VAE-only.
 simple_vae_loss's edge weight 0.2 is not used either: that path zeros
 boundary and Haar, and diffusion.py evaluates all three.
@@ -45,9 +44,17 @@ mechanics_weight is 0 and the mechanics surrogate is not constructed.
 diffusion.py itself forces mechanics_weight to 0 unless stage is
 diffusion_feedback.
 
-The frozen VAE only decodes. The pixel target is the decode of the clean
-window latent already stored in 02_整图潜变量_八个视角. Source BMP/PNG files
-are not read. ID03 is not read.
+The frozen VAE only decodes the predicted clean latent. The four structure
+targets are the original 256x256 window, loaded from 06_可打开的窗口小图.
+Those PNGs are the RGB crops export_preview_pngs.py wrote. The fourth channel
+is packed from those same pixels by ebsd_feedback.data.image_to_tensor, which
+is how 013 turns an RGB window into the four-channel training image. The clean
+latent is not decoded to make the target. ID03 images are not read.
+
+The four terms are not applied at every timestep. diffusion.py gates its other
+image terms with descriptor_low_noise_fraction, whose code default is 0.3:
+active when timesteps < int(training_timesteps * 0.3). Noise loss stays on
+every step. A high timestep contributes no pixel, edge, boundary, or Haar loss.
 
 Optimizer settings stay those of train_round1.py: AdamW lr 0.0001,
 weight decay 0.0001, betas (0.9, 0.95), gradient clip 1.0, constant lr.
@@ -66,6 +73,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from PIL import Image
 from torch.nn import functional as F
 
 from train_round1 import (
@@ -106,8 +114,16 @@ LOSS_OVERLAY = 0.0
 LOSS_ORIENTATION = 0.0
 ROUND1_EPOCHS = 200
 MAX_EXTRA_EPOCHS = 200
+FORBIDDEN_START_EPOCHS = (400, 600)
+FORBIDDEN_CHECKPOINT_NAMES = ("checkpoint_epoch400.pt", "checkpoint_epoch600.pt")
+# diffusion.py: getattr(config.loss, "descriptor_low_noise_fraction", 0.3)
+# Overlay and descriptor terms use timesteps < int(timesteps * fraction).
+LOW_NOISE_FRACTION = 0.3
 # Existing spot-check folders. A finished run writes a different directory.
-RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮")
+RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600")
+# A new log, so the earlier train_round2_loss.csv on the server stays intact.
+LOSS_LOG_NAME = "train_round2_原图低噪声.csv"
+CONFIG_NAME = "第二轮原图低噪声配置.json"
 
 
 def _import_structure():
@@ -116,16 +132,16 @@ def _import_structure():
         raise FileNotFoundError(f"缺少 013 源码: {pkg}")
     if str(pkg) not in sys.path:
         sys.path.insert(0, str(pkg))
+    from ebsd_feedback.data import image_to_tensor
     from ebsd_feedback.losses import VaeLossWeights, boundary_loss, edge_loss, haar_loss
     from ebsd_feedback.models.vae import BoundaryAwareVAE
-    return VaeLossWeights, boundary_loss, edge_loss, haar_loss, BoundaryAwareVAE
+    return VaeLossWeights, boundary_loss, edge_loss, haar_loss, BoundaryAwareVAE, image_to_tensor
 
 
-VaeLossWeights, boundary_loss, edge_loss, haar_loss, BoundaryAwareVAE = _import_structure()
+VaeLossWeights, boundary_loss, edge_loss, haar_loss, BoundaryAwareVAE, image_to_tensor = _import_structure()
 _STRUCTURE_SOURCE = VaeLossWeights()
-# diffusion.py calls this term loss.image and applies it to a full four-channel L1.
-# VaeLossWeights.rgb is 1.0. Raised to 4.0 after the epoch-400 windows stayed noise.
-LOSS_IMAGE = 4.0
+# Full four-channel L1. Weight is VaeLossWeights.rgb, not the earlier 4.0 trial.
+LOSS_IMAGE = float(_STRUCTURE_SOURCE.rgb)
 LOSS_EDGE = float(_STRUCTURE_SOURCE.edge)
 LOSS_BOUNDARY = float(_STRUCTURE_SOURCE.boundary)
 LOSS_HAAR = float(_STRUCTURE_SOURCE.haar)
@@ -141,13 +157,70 @@ def structure_loss_weights() -> dict[str, float]:
 
 
 def image_structure_losses(decoded: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Same four calls as training/diffusion.py when should_decode is true."""
+    """Same four calls as training/diffusion.py. target is the original window."""
     return {
         "image": F.l1_loss(decoded, target),
         "edge": edge_loss(decoded, target),
         "boundary": boundary_loss(decoded, target),
         "haar": haar_loss(decoded, target),
     }
+
+
+def low_noise_mask(
+    timesteps: torch.Tensor,
+    total_timesteps: int,
+    fraction: float = LOW_NOISE_FRACTION,
+) -> torch.Tensor:
+    """True where t is in the low-noise part of the schedule.
+
+    Same comparison diffusion.py uses for overlay and descriptor terms:
+    timesteps < int(training_timesteps * low_noise_fraction).
+    """
+    fraction = min(max(float(fraction), 0.0), 1.0)
+    threshold = int(total_timesteps * fraction)
+    if threshold <= 0:
+        return torch.zeros_like(timesteps, dtype=torch.bool)
+    return timesteps < threshold
+
+
+def structure_losses_for_timesteps(
+    decoded: torch.Tensor,
+    target: torch.Tensor,
+    timesteps: torch.Tensor,
+    total_timesteps: int,
+) -> dict[str, torch.Tensor]:
+    """Pixel, edge, boundary, and Haar only on low-noise rows. Others contribute 0."""
+    active = low_noise_mask(timesteps, total_timesteps, LOW_NOISE_FRACTION)
+    if not bool(active.any()):
+        zero = decoded.sum() * 0.0
+        return {name: zero for name in ("image", "edge", "boundary", "haar")}
+    return image_structure_losses(decoded[active], target[active])
+
+
+def window_png_path(window_dir: Path, row: dict[str, str]) -> Path:
+    alloy = row["alloy_id"]
+    if alloy == HOLDOUT:
+        raise RuntimeError("训练不读 ID03 的窗口图")
+    name = f"{alloy}_{row['view']}_y{int(row['pixel_y'])}_x{int(row['pixel_x'])}.png"
+    return window_dir / alloy / name
+
+
+def load_original_window(path: Path) -> torch.Tensor:
+    """RGB PNG plus the fourth channel 013 packs from those same pixels."""
+    if HOLDOUT in path.parts:
+        raise RuntimeError(f"不读 ID03 的图: {path}")
+    if not path.is_file():
+        raise FileNotFoundError(f"缺少训练窗口原图 {path}")
+    with Image.open(path) as source:
+        rgb = source.convert("RGB")
+        tensor = image_to_tensor(rgb)
+    if tensor.shape != (4, 256, 256):
+        raise RuntimeError(f"{path.name} 应为 4x256x256，实际 {tuple(tensor.shape)}")
+    return tensor
+
+
+def load_original_batch(window_dir: Path, rows: list[dict[str, str]]) -> torch.Tensor:
+    return torch.stack([load_original_window(window_png_path(window_dir, row)) for row in rows])
 
 
 def diffusion_structure_total(
@@ -171,19 +244,30 @@ def diffusion_structure_total(
 
 
 def resolve_epoch_range(start_epoch: int, extra_epochs: int) -> tuple[int, int]:
-    """Continue from the epoch stored in the checkpoint the user passed.
-
-    Round 1 ends at epoch 200. Later checkpoints, including epoch 400, are
-    valid starts. One invocation still adds at most 200 epochs.
-    """
+    """Start at the round-1 noise checkpoint and add at most 200 epochs."""
     if extra_epochs < 1 or extra_epochs > MAX_EXTRA_EPOCHS:
         raise RuntimeError("这一段最多再训 200 轮，不要退回 80000 步")
-    if start_epoch < ROUND1_EPOCHS:
+    if start_epoch in FORBIDDEN_START_EPOCHS:
         raise RuntimeError(
-            f"断点至少要到第 {ROUND1_EPOCHS} 轮，实际第 {start_epoch} 轮。"
-            "把 --checkpoint 指到 checkpoint_epoch200.pt 或更后面的断点。"
+            "不要从第 400 轮或第 600 轮继续。把 --checkpoint 指到第一轮噪声断点，第 200 轮。"
+        )
+    if start_epoch != ROUND1_EPOCHS:
+        raise RuntimeError(
+            f"这一次从第一轮噪声断点第 {ROUND1_EPOCHS} 轮开始，实际第 {start_epoch} 轮。"
         )
     return start_epoch, start_epoch + extra_epochs
+
+
+def assert_round1_checkpoint(path: Path, start_epoch: int) -> None:
+    if path.name in FORBIDDEN_CHECKPOINT_NAMES or start_epoch in FORBIDDEN_START_EPOCHS:
+        raise RuntimeError(
+            "不要从 checkpoint_epoch400.pt 或 checkpoint_epoch600.pt 继续。"
+            "把 --checkpoint 指到 04_训练日志/checkpoint_epoch200.pt。"
+        )
+    if start_epoch != ROUND1_EPOCHS:
+        raise RuntimeError(
+            f"载入的断点是第 {start_epoch} 轮。这一次要用第一轮噪声断点第 {ROUND1_EPOCHS} 轮。"
+        )
 
 
 def writes_checkpoints(smoke: bool) -> bool:
@@ -195,10 +279,10 @@ def writes_id03_images(smoke: bool) -> bool:
 
 
 def heldout_sample_dir(log_dir: Path, end_epoch: int) -> Path:
-    """A new folder under the log directory. Does not reuse an existing spot check."""
+    """A new folder under the log directory. Reserved names are never reused."""
     stem = f"ID03抽查_epoch{end_epoch:03d}"
     candidate = log_dir / stem
-    suffix = 1
+    suffix = 0
     while candidate.name in RESERVED_SAMPLE_DIRS or candidate.exists():
         suffix += 1
         candidate = log_dir / f"{stem}_{suffix}"
@@ -283,6 +367,8 @@ def save_checkpoint(path: Path, model, ema, optimizer, epoch: int, step: int, va
             "loss_descriptor_weight": LOSS_DESCRIPTOR,
             "loss_unrolled_descriptor_weight": LOSS_UNROLLED_DESCRIPTOR,
             "loss_overlay_weight": LOSS_OVERLAY,
+            "low_noise_fraction": LOW_NOISE_FRACTION,
+            "pixel_target": "original_window_png",
         },
         path,
     )
@@ -296,9 +382,15 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Checkpoint to resume. Not stored in git. Example: 04_训练日志/checkpoint_epoch400.pt",
+        help="Round-1 noise checkpoint passed by the user. Not stored in git. On the server: 04_训练日志/checkpoint_epoch200.pt. Do not pass checkpoint_epoch400.pt or checkpoint_epoch600.pt.",
     )
     parser.add_argument("--latent-dir", type=Path, default=root / "02_整图潜变量_八个视角")
+    parser.add_argument(
+        "--window-dir",
+        type=Path,
+        default=root / "06_可打开的窗口小图",
+        help="256x256 training-window PNGs. Pixel, edge, boundary, and Haar use these pixels.",
+    )
     parser.add_argument("--crops", type=Path, default=table_dir / "crops.csv")
     parser.add_argument("--val-strip", type=Path, default=table_dir / "val_strip.csv")
     parser.add_argument("--conditions", type=Path, default=table_dir / "conditions.csv")
@@ -335,8 +427,10 @@ def main() -> None:
     weights = structure_loss_weights()
     if list(weights) != ["image", "edge", "boundary", "haar"]:
         raise RuntimeError(f"结构损失项不对: {list(weights)}")
-    if weights["image"] != 4.0:
-        raise RuntimeError("四通道像素 L1 权重必须是 4.0")
+    if weights["image"] != float(_STRUCTURE_SOURCE.rgb):
+        raise RuntimeError("四通道像素 L1 权重必须是 VaeLossWeights.rgb，也就是 1.0")
+    if not args.window_dir.is_dir():
+        raise FileNotFoundError(f"缺少训练窗口原图目录 {args.window_dir}")
     if (weights["edge"], weights["boundary"], weights["haar"]) != (
         float(_STRUCTURE_SOURCE.edge),
         float(_STRUCTURE_SOURCE.boundary),
@@ -359,6 +453,7 @@ def main() -> None:
     precision = "bf16" if device.type == "cuda" else "fp32"
     state = _load_checkpoint(args.checkpoint, device)
     start_epoch = int(state["epoch"])
+    assert_round1_checkpoint(args.checkpoint, start_epoch)
     start_epoch, end_epoch = resolve_epoch_range(start_epoch, args.epochs)
     if float(state.get("mechanics_loss_weight", 0.0)) != 0.0:
         raise RuntimeError("载入的断点 mechanics_loss_weight 不是 0")
@@ -373,6 +468,7 @@ def main() -> None:
         f"resume_epoch={start_epoch} through_epoch={end_epoch} checkpoint={args.checkpoint} "
         f"lr={LEARNING_RATE} betas={ADAMW_BETAS} "
         f"loss_image={LOSS_IMAGE} loss_edge={LOSS_EDGE} loss_boundary={LOSS_BOUNDARY} loss_haar={LOSS_HAAR} "
+        f"low_noise_fraction={LOW_NOISE_FRACTION} window_dir={args.window_dir} "
         f"mechanics_weight={MECHANICS_LOSS_WEIGHT}",
         flush=True,
     )
@@ -400,7 +496,7 @@ def main() -> None:
     if args.smoke:
         if writes_checkpoints(True) or writes_id03_images(True):
             raise RuntimeError("smoke 不写断点，也不写 ID03 图")
-        _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, device, precision, step)
+        _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, args.window_dir, device, precision, step)
         return
     val_rows = [row for row in read_table(args.val_strip) if row["alloy_id"] != HOLDOUT]
     if not val_rows:
@@ -412,11 +508,11 @@ def main() -> None:
         flush=True,
     )
     args.log_dir.mkdir(parents=True, exist_ok=True)
-    (args.log_dir / "第二轮结构损失配置.json").write_text(
+    (args.log_dir / CONFIG_NAME).write_text(
         json.dumps(_config_record(args, precision, steps_per_epoch, start_epoch, end_epoch), ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
-    log_path = args.log_dir / "train_round2_loss.csv"
+    log_path = args.log_dir / LOSS_LOG_NAME
     fields = [
         "epoch", "step", "loss_total", "loss_noise", "loss_image", "loss_edge",
         "loss_boundary", "loss_haar", "loss_mechanics", "val_noise",
@@ -433,7 +529,7 @@ def main() -> None:
         for start in range(0, len(order), args.batch_size):
             batch_rows = [crops[int(i)] for i in order[start:start + args.batch_size]]
             step, row = _optimizer_step(
-                model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, device, precision, step,
+                model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, args.window_dir, device, precision, step,
             )
             epoch_total.append(float(row["loss_total"]))
             is_last = start + args.batch_size >= len(order)
@@ -463,9 +559,10 @@ def main() -> None:
         write_heldout_samples(final_checkpoint, args.vae, sample_dir, args.seed)
 
 
-def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, device, precision, step):
+def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, window_dir, device, precision, step):
     latent = crop_batch(store, batch_rows).to(device, non_blocking=True)
     condition = torch.stack([cond_map[row["alloy_id"]] for row in batch_rows], 0).to(device, non_blocking=True)
+    target = load_original_batch(window_dir, batch_rows).to(device, non_blocking=True)
     noise = torch.randn_like(latent)
     timesteps = torch.randint(0, schedule.timesteps, (latent.shape[0],), device=device)
     noisy = schedule.add_noise(latent, noise, timesteps)
@@ -475,10 +572,14 @@ def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, con
         predicted = model(noisy, timesteps, condition, drop)
         loss_noise = noise_loss(schedule, predicted, noise, timesteps)
         predicted_clean = schedule.predict_clean(noisy, predicted, timesteps).clamp(-5.0, 5.0)
-        decoded = vae.decode(predicted_clean / LATENT_SCALE)
-    with torch.no_grad(), _autocast(precision):
-        target = vae.decode(latent / LATENT_SCALE)
-    parts = image_structure_losses(decoded, target.to(dtype=decoded.dtype))
+        # diffusion.py gates overlay and descriptor with timesteps < int(schedule.timesteps * 0.3).
+        active = low_noise_mask(timesteps, int(schedule.timesteps))
+        if bool(active.any()):
+            decoded = vae.decode(predicted_clean[active] / LATENT_SCALE)
+            parts = image_structure_losses(decoded, target[active].to(dtype=decoded.dtype))
+        else:
+            zero = predicted_clean.sum() * 0.0
+            parts = {name: zero for name in ("image", "edge", "boundary", "haar")}
     total = diffusion_structure_total(loss_noise, parts)
     if not bool(torch.isfinite(total)):
         raise RuntimeError("第二轮损失出现 NaN/Inf")
@@ -505,8 +606,7 @@ def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, con
 def write_heldout_samples(checkpoint: Path, vae_path: Path, out_dir: Path, seed: int) -> Path:
     """Same four DDIM windows as sample_id03.py --mode sample.
 
-    Uses the holdout condition row only. Does not read an ID03 image, a BMP, or a PNG.
-    The training pixel target stays the decode of the stored clean latent.
+    Uses the holdout condition row only. Does not read an ID03 image.
     """
     from sample_id03 import GUIDANCE_SCALE, SAMPLING_STEPS, sample_id03 as sample_holdout
     namespace = argparse.Namespace(
@@ -525,13 +625,13 @@ def write_heldout_samples(checkpoint: Path, vae_path: Path, out_dir: Path, seed:
     return out_dir
 
 
-def _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, device, precision, step) -> None:
+def _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, window_dir, device, precision, step) -> None:
     rng = np.random.default_rng([args.seed, int(args.epochs)])
     order = epoch_order(groups, rng, args.batch_size)
     batch_rows = [crops[int(i)] for i in order[: args.batch_size]]
     model.train()
     new_step, row = _optimizer_step(
-        model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, device, precision, step,
+        model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, window_dir, device, precision, step,
     )
     print(
         f"smoke_ok step={new_step} loss_total={row['loss_total']} loss_noise={row['loss_noise']} "
@@ -548,7 +648,7 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "round": 2,
         "holdout": HOLDOUT,
         "checkpoint": str(args.checkpoint),
-        "checkpoint_note": "passed by the user; not in git. Next server run: 04_训练日志/checkpoint_epoch400.pt",
+        "checkpoint_note": "passed by the user; not in git. Resume 04_训练日志/checkpoint_epoch200.pt. Leave checkpoint_epoch400.pt and checkpoint_epoch600.pt unused.",
         "start_epoch": start_epoch,
         "end_epoch": end_epoch,
         "extra_epochs": end_epoch - start_epoch,
@@ -570,11 +670,16 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "ema_decay": EMA_DECAY,
         "precision": precision,
         "vae_frozen": True,
-        "pixel_target": "frozen VAE decode of the clean latent window; BMP and PNG files are not read; ID03 is not read",
+        "window_dir": str(args.window_dir),
+        "pixel_target": "original 256x256 PNG under 06_可打开的窗口小图, packed by image_to_tensor. The stored clean latent is not decoded as the target. ID03 images are not read.",
+        "low_noise_fraction": LOW_NOISE_FRACTION,
+        "structure_timestep_gate": "pixel, edge, boundary, and Haar only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step.",
+        "low_noise_fraction_source": "training/diffusion.py getattr(config.loss, descriptor_low_noise_fraction, 0.3), the gate on overlay and descriptor",
         "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
         "mechanics_surrogate": "not constructed",
         "loss_weights": structure_loss_weights(),
-        "loss_weight_source": "edge/boundary/haar from losses.py VaeLossWeights; pixel L1 raised from VaeLossWeights.rgb 1.0 to 4.0 after epoch 400",
+        "loss_weight_source": "losses.py VaeLossWeights rgb 1.0, edge 0.5, boundary 0.25, haar 0.25. The pixel weight 4.0 trial is not used.",
+        "loss_log": LOSS_LOG_NAME,
         "loss_formula_source": "013代码/src/ebsd_feedback/training/diffusion.py image L1, edge_loss, boundary_loss, haar_loss",
         "yaml_not_in_tree": "06_配置文件/03_基础条件扩散.yaml was not copied. diffusion.py reads config.loss.image/edge/boundary/haar and does not literalize them.",
         "vae_terms_not_in_diffusion_total": {

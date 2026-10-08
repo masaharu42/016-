@@ -24,7 +24,11 @@ python "03_训练代码_从013复制后再改/sample_id03.py" --mode memorizatio
 
 python "03_训练代码_从013复制后再改/sample_id03.py" --mode sample --checkpoint "04_训练日志/checkpoint_epoch200.pt"
 
-第一轮 200 轮只训噪声，记录留在 train_round1.py，不要改那个脚本。抽出来的窗口如果还是彩色像素噪声、没有晶粒和黑晶界，就从第一轮最后的断点接着训，把图像结构损失打开。断点不在 git 里，在服务器本目录的 04_训练日志/checkpoint_epoch200.pt。下面这条命令用 --checkpoint 指向它。默认再训 200 轮，一批 16 张，bf16。力学权重仍是 0，不加载力学代理。VAE 仍冻住，只在结构损失要像素时解码，不读原图，也不读 ID03。
+第一轮 200 轮只训噪声，记录留在 train_round1.py，不要改那个脚本。抽出来的窗口如果还是彩色像素噪声、没有晶粒和黑晶界，就从第一轮最后的断点接着训，把图像结构损失打开。断点不在 git 里，在服务器本目录的 04_训练日志/checkpoint_epoch200.pt。
+
+从第 200 轮把潜变量再解码一次当像素目标、每个时间步都加结构损失，训到第 400 轮，四张留出窗口仍是彩色噪声。接着从 checkpoint_epoch400.pt 把像素 L1 提到 4.0，训到第 600 轮，四张窗口仍是彩色噪声，没有晶粒，也没有黑晶界。这两份断点不要再接着训，权重也不要再加大。
+
+下一次仍从第一轮噪声断点开始。命令里传入 --checkpoint，服务器上是 04_训练日志/checkpoint_epoch200.pt。不要传 checkpoint_epoch400.pt 或 checkpoint_epoch600.pt。默认再训 200 轮，到第 400 轮，一批 16 张，bf16。力学权重仍是 0，不加载力学代理。如果提示没有 pandas，先再执行一次开头的 pip。train_round2.py 用 013 的 image_to_tensor 读窗口原图，那个文件会 import pandas。
 
 python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch200.pt"
 
@@ -32,12 +36,8 @@ python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_
 
 python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch200.pt" --batch-size 8
 
-结构项是 013 扩散训练里的四项，见 013代码/src/ebsd_feedback/training/diffusion.py：像素 L1、边缘、晶界、Haar。边缘 0.5、晶界 0.25、Haar 0.25 仍是 013代码/src/ebsd_feedback/losses.py 里 VaeLossWeights 的数字。SSIM、平坦、KL、描述符、展开描述符、叠加不加。噪声权重仍是 1。力学权重仍是 0。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。013 那套给 80000 步用的余弦学习率这一折不用。
+结构项仍是 013 扩散训练里的四项，见 013代码/src/ebsd_feedback/training/diffusion.py：像素 L1、边缘、晶界、Haar。像素 L1 回到 losses.py 里 VaeLossWeights.rgb 的 1.0。边缘 0.5、晶界 0.25、Haar 0.25 仍是同一处的数字。噪声权重仍是 1，每一步都算。SSIM、平坦、KL、描述符、展开描述符、叠加不加。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。013 那套给 80000 步用的余弦学习率这一折不用。
 
-像素 L1 先用了 VaeLossWeights.rgb 的 1.0，从第 200 轮训到第 400 轮。留出 ID03 的四张窗口仍是没有晶粒、没有黑晶界的彩色噪声，日志里的 total 大约 1.2，噪声项大约 0.06。下一次只把四通道像素 L1 提到 4.0，其它权重不动。断点由命令传入，代码里不写死一个不在 git 里的文件。服务器上接着用第 400 轮这份。默认再训 200 轮，到第 600 轮。正常结束会按 sample_id03.py 的抽法，把留出 ID03 的窗口写到 04_训练日志 下一个新文件夹，不覆盖 ID03抽查 和 ID03抽查_第二轮，并打印 id03_sample_dir。像素目标仍是已存干净潜变量的解码，不读 BMP/PNG，也不读 ID03 的图。--smoke 只走一步，不写断点，也不写图。
+像素、边缘、晶界、Haar 的目标是训练窗口原图，不是把已存干净潜变量再解码一次。原图在 06_可打开的窗口小图，每张 256×256。第四通道按 013 的 image_to_tensor 从这张 RGB 里填。不读 ID03 的图。VAE 仍冻住，只解码预测出来的干净潜变量。这四项只在低噪声时间步计算，和 013 里其它图像项的低噪声比例一样：时间步小于 int(1000 * 0.3)，也就是小于 300。噪声损失每一步都算。
 
-python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch400.pt"
-
-显存不够时一批仍是 8 张，最多再训 200 轮。
-
-python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch400.pt" --batch-size 8
+正常结束会按 sample_id03.py 的抽法，把留出 ID03 的窗口写到 04_训练日志 下一个新文件夹，不覆盖 ID03抽查、ID03抽查_第二轮、ID03抽查_epoch600，并打印 id03_sample_dir。损失记在 04_训练日志/train_round2_原图低噪声.csv，不覆盖原来的 train_round2_loss.csv。--smoke 只走一步，不写断点，也不写图。
