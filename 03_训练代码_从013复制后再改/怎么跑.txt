@@ -1,0 +1,25 @@
+把整个 016_切块扩散第一轮 文件夹上传到 Ubuntu 服务器的数据盘。只训留出 ID03 的这一折。训练读本目录里的 csv 和 npy，不重新编码，不读 ID03 的原图，也不改 013。
+
+下面的命令都在项目根目录执行。这个目录里要能直接看到 01_窗口清单_每个窗口的位置和描述符、02_整图潜变量_八个视角、03_训练代码_从013复制后再改。
+
+cd 016_切块扩散第一轮
+
+python -m pip install -r "03_训练代码_从013复制后再改/requirements.txt"
+
+python "03_训练代码_从013复制后再改/train_round1.py"
+
+服务器镜像里已经有 torch 2.12.1 和 CUDA 13.0。上面的 pip 不会重装 torch。默认一批 16 张，bf16，200 轮，21 步一轮，一共 4200 步。断点写到 04_训练日志，每 50 轮一份，最后一轮再存一份。每一步的噪声损失写到 04_训练日志/train_noise_loss.csv。右侧验证条的噪声损失每一轮记在这个表最后一步的 val_noise 列里，只记录，不停训练。
+
+显存不够时改成一批 8 张。一轮变成 42 步，仍然 200 轮，不要改回 80000 步。
+
+python "03_训练代码_从013复制后再改/train_round1.py" --batch-size 8
+
+背图检查不在训练循环里。50 轮和 100 轮的断点出来之后，另外运行下面的命令。它会抽出 4 个窗口，解码后和清单里的训练窗口比 RGB 像素相关。max_pixel_corr 接近 1（阈值 0.98）就停掉训练。验证损失上升不要拿来停。
+
+python "03_训练代码_从013复制后再改/sample_id03.py" --mode memorization --checkpoint "04_训练日志/checkpoint_epoch050.pt"
+
+python "03_训练代码_从013复制后再改/sample_id03.py" --mode memorization --checkpoint "04_训练日志/checkpoint_epoch100.pt"
+
+训练全部结束之后才生成留出的 ID03。这一步不会被训练脚本调用，也不读 ID03 的原图。
+
+python "03_训练代码_从013复制后再改/sample_id03.py" --mode sample --checkpoint "04_训练日志/checkpoint_epoch200.pt"

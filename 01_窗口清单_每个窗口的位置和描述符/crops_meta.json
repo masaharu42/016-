@@ -1,0 +1,15 @@
+{
+  "seed": 20261008,
+  "generator": "numpy.random.SeedSequence.spawn per alloy, then choice without replacement",
+  "windows_per_alloy": 256,
+  "crop_rows": 5376,
+  "val_strip_rows": 160,
+  "descriptors_are_model_inputs": false,
+  "parent_grain": "centroid inside window, size is the full grain; area weights use in-window pixels; border is not a boundary",
+  "right_strip": "latent_x = width-64, latent_y = 0, one 64x64 window per encoded view",
+  "portrait_views_in_crops": false,
+  "resized_hw": [
+    448,
+    768
+  ]
+}

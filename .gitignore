@@ -1,0 +1,11 @@
+# code and the small window tables only
+02_*/
+04_*/
+05_*/
+06_*/
+07_*/
+*.pt
+*.npy
+*.png
+__pycache__/
+*.pyc
