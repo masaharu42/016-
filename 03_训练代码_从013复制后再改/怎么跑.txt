@@ -38,7 +38,7 @@ python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_
 
 python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_训练日志/checkpoint_epoch200.pt" --batch-size 8
 
-上面这一段已经跑完，停在第 1152 轮。留出 ID03 的窗口现在能看出晶粒和黑晶界，但还比较乱。0.25 和 0.1 的 SSIM 加描述符都比第 1152 轮更差，所以这两项现在权重是 0。下一次仍从 04_训练日志/checkpoint_epoch1152.pt 接着训。不要传 checkpoint_epoch400.pt 或 checkpoint_epoch600.pt。一次仍大约 20000 个优化步，不超过这个上限，也不要退回 80000 步。力学权重仍是 0。
+上面这一段已经跑完，停在第 1152 轮。留出 ID03 的窗口现在能看出晶粒和黑晶界，但还比较乱。SSIM 保持 0。描述符单独设成 0.1。下一次仍从 04_训练日志/checkpoint_epoch1152.pt 接着训。不要传 checkpoint_epoch400.pt 或 checkpoint_epoch600.pt。一次仍大约 20000 个优化步，不超过这个上限，也不要退回 80000 步。力学权重仍是 0。
 
 一批 16 张时，一轮 21 步，默认再训 952 轮，19992 个优化步，从第 1152 轮到第 2104 轮。
 
@@ -50,6 +50,6 @@ python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_
 
 描述符代理默认读 07_013各折已有权重/ID03/02b_图像描述符代理/图像描述符_最终模型.pt。服务器上如果没有这份文件，从 013 的 ID03 折把 图像描述符_最终模型.pt 和配套的 VAE_最终模型.pt 一起复制过来。对不上 VAE 的校验就不会开训。
 
-像素 L1 仍是 1.0，边缘 0.5，晶界 0.25，Haar 0.25，噪声 1。SSIM 和描述符都是 0，不用 VaeLossWeights.ssim 的 0.25，也不再用 0.1。0.25 和 0.1 两轮都比第 1152 轮晶界更软、黑晶界更弱、颜色更饱和。图像项的目标仍是 06_可打开的窗口小图 里的原图，只在时间步小于 300 时计算。展开描述符和叠加仍是 0。平坦、KL 不加。开训时打印 structure_weights，六项以 ssim 0、descriptor 0 结束。
+像素 L1 仍是 1.0，边缘 0.5，晶界 0.25，Haar 0.25，噪声 1。SSIM 是 0，不用 VaeLossWeights.ssim 的 0.25。描述符是 0.1，用冻住的 013 图像描述符代理。目标是 crops.csv 里每个窗口自己的五个描述符。某一列空着或不是数，这个窗口这一步不算描述符。描述符还要求低噪声，并且这一步没有丢掉条件。展开描述符和叠加仍是 0。平坦、KL 不加。开训时打印 structure_weights，六项以 ssim 0、descriptor 0.1 结束。
 
-每一轮结束都立刻打印 train_total、noise、image、edge、boundary、haar、ssim、descriptor 和 val_noise，并刷新输出。损失写入 04_训练日志/train_round2_无ssim无描述符.csv，不覆盖 train_round2_ssim描述符.csv 和 train_round2_ssim描述符_权重0.1.csv。从第 1152 轮开始时这个新表从头写。正常结束仍把留出 ID03 的窗口写到新文件夹，打印 id03_sample_dir，不覆盖 ID03抽查、ID03抽查_第二轮、ID03抽查_epoch600、ID03抽查_epoch1152。--smoke 只走一步，不写断点，也不写图。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。仍从 checkpoint_epoch1152.pt 开始，一批 16 张默认到第 2104 轮。
+每一轮结束都立刻打印 train_total、noise、image、edge、boundary、haar、ssim、descriptor 和 val_noise，再打印一行 GPU 利用率（有 pynvml 就用它，否则调用 nvidia-smi；读不到就打印 gpu util unavailable，训练继续），并刷新输出。损失写入 04_训练日志/train_round2_无ssim_描述符0.1.csv，不覆盖 train_round2_ssim描述符.csv、train_round2_ssim描述符_权重0.1.csv 和 train_round2_无ssim无描述符.csv。从第 1152 轮开始时这个新表从头写。正常结束仍把留出 ID03 的窗口写到新文件夹，打印 id03_sample_dir，不覆盖 ID03抽查、ID03抽查_第二轮、ID03抽查_epoch600、ID03抽查_epoch1152。--smoke 只走一步，不写断点，也不写图。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。仍从 checkpoint_epoch1152.pt 开始，一批 16 张默认到第 2104 轮。

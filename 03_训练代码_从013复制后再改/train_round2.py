@@ -9,13 +9,12 @@ Each invocation does about 20000 optimizer steps and cannot pass that target.
 It does not return to the 80000-step schedule. Batch 16 draws 21 steps per
 epoch, so the default is 952 more epochs (19992 steps): 1152 through 2104.
 Batch 8 draws 42 steps per epoch, so the default is 476 more epochs and ends
-at epoch 1628. Every epoch prints the total and each term, flushed.
+at epoch 1628. Every epoch prints the total, each term, and one GPU utilization sample, flushed.
 
-SSIM and the window descriptor stay in the six-term map with weight 0.
-The 0.25 run and the later 0.1 run both looked worse than epoch 1152
-(softer boundaries, weaker black grain boundaries, more saturated color),
-so this rerun turns both terms off. VaeLossWeights.ssim stays 0.25 in the
-dataclass and is not used. Unrolled descriptor and overlay stay 0.
+SSIM stays in the six-term map at weight 0. The 0.25 and 0.1 SSIM runs
+softened boundaries, so SSIM stays off. The descriptor term is 0.1.
+VaeLossWeights.ssim stays 0.25 in the dataclass and is not used.
+Unrolled descriptor and overlay stay 0.
 
 Image-structure terms are the four that training/diffusion.py adds on top of
 the noise loss when it decodes (not the VAE-only SSIM, flatness, or KL terms):
@@ -51,8 +50,9 @@ boundary and Haar, and diffusion.py evaluates all three.
 
 Unrolled descriptor and overlay stay 0. Orientation stays 0.
 mechanics_weight is 0 and the mechanics surrogate is not constructed.
-The descriptor term stays in the map at weight 0. The 0.25 and 0.1 runs
-both looked worse than epoch 1152, so it does not enter the trained total.
+The descriptor term is the frozen image proxy, weight 0.1, gated by
+descriptor_consistency: low noise, not condition-dropped, and the window's
+own five descriptors present. SSIM is multiplied by 0.
 diffusion.py itself forces mechanics_weight to 0 unless stage is
 diffusion_feedback.
 
@@ -81,6 +81,7 @@ import argparse
 import csv
 import json
 import math
+import subprocess
 import sys
 from pathlib import Path
 
@@ -121,9 +122,9 @@ from train_round1 import (
 )
 
 MECHANICS_LOSS_WEIGHT = 0.0
-# The 0.25 and 0.1 runs both looked worse than epoch 1152. This rerun is off.
+# SSIM stays off. The descriptor is back at 0.1 by itself.
 # diffusion.py reads config.loss.descriptor; the yaml was not copied.
-LOSS_DESCRIPTOR = 0.0
+LOSS_DESCRIPTOR = 0.1
 LOSS_UNROLLED_DESCRIPTOR = 0.0
 LOSS_OVERLAY = 0.0
 LOSS_ORIENTATION = 0.0
@@ -144,8 +145,8 @@ LOW_NOISE_FRACTION = 0.3
 # Existing spot-check folders. A finished run writes a different directory.
 RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600", "ID03抽查_epoch1152")
 # A new log, so the earlier round-2 csv files on the server stay intact.
-LOSS_LOG_NAME = "train_round2_无ssim无描述符.csv"
-CONFIG_NAME = "第二轮无ssim无描述符配置.json"
+LOSS_LOG_NAME = "train_round2_无ssim_描述符0.1.csv"
+CONFIG_NAME = "第二轮无ssim_描述符0.1配置.json"
 WINDOW_DESCRIPTOR_FIELDS = (
     "D50",
     "log_spread",
@@ -220,14 +221,14 @@ def structure_loss_weights() -> dict[str, float]:
 
 
 def check_structure_weights(weights: dict[str, float] | None = None) -> dict[str, float]:
-    """Keep SSIM and the descriptor in the map, both exactly off."""
+    """Keep SSIM off and the descriptor at 0.1."""
     weights = structure_loss_weights() if weights is None else weights
     if list(weights) != list(STRUCTURE_TERM_KEYS):
         raise RuntimeError(f"结构损失项不对: {list(weights)}")
     if weights["image"] != float(_STRUCTURE_SOURCE.rgb):
         raise RuntimeError("四通道像素 L1 权重必须是 VaeLossWeights.rgb，也就是 1.0")
-    if weights["ssim"] != 0.0 or weights["descriptor"] != 0.0:
-        raise RuntimeError("SSIM 和描述符权重必须是 0")
+    if weights["ssim"] != 0.0 or weights["descriptor"] != 0.1:
+        raise RuntimeError("SSIM 权重必须是 0，描述符权重必须是 0.1")
     if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0 or MECHANICS_LOSS_WEIGHT != 0.0:
         raise RuntimeError("展开描述符、叠加、力学必须是 0")
     if (weights["edge"], weights["boundary"], weights["haar"]) != (
@@ -684,6 +685,74 @@ def enable_live_stdout() -> None:
             return
 
 
+def _format_gpu_query(text: str) -> str:
+    rows = []
+    for index, raw in enumerate(text.strip().splitlines()):
+        pieces = [piece.strip() for piece in raw.split(",")]
+        if len(pieces) != 3 or any(not piece for piece in pieces):
+            return "gpu util unavailable"
+        util, used, total = pieces
+        rows.append(f"gpu{index} util {util}% memory {used}/{total} MiB")
+    if not rows:
+        return "gpu util unavailable"
+    return " ".join(rows)
+
+
+def _gpu_utilization_pynvml() -> str:
+    import pynvml
+    pynvml.nvmlInit()
+    try:
+        count = pynvml.nvmlDeviceGetCount()
+        rows = []
+        for index in range(count):
+            handle = pynvml.nvmlDeviceGetHandleByIndex(index)
+            util = pynvml.nvmlDeviceGetUtilizationRates(handle)
+            memory = pynvml.nvmlDeviceGetMemoryInfo(handle)
+            used = int(memory.used) // (1024 * 1024)
+            total = int(memory.total) // (1024 * 1024)
+            rows.append(f"gpu{index} util {int(util.gpu)}% memory {used}/{total} MiB")
+        return " ".join(rows)
+    finally:
+        try:
+            pynvml.nvmlShutdown()
+        except Exception:
+            pass
+
+
+def _gpu_utilization_nvidia_smi() -> str:
+    completed = subprocess.run(
+        [
+            "nvidia-smi",
+            "--query-gpu=utilization.gpu,memory.used,memory.total",
+            "--format=csv,noheader,nounits",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=2,
+    )
+    if completed.returncode != 0:
+        return "gpu util unavailable"
+    return _format_gpu_query(completed.stdout)
+
+
+def gpu_utilization_line() -> str:
+    """One nvidia-smi style sample. A missing tool or a bad reading does not raise."""
+    try:
+        line = _gpu_utilization_pynvml()
+        if line:
+            return line
+    except Exception:
+        pass
+    try:
+        line = _gpu_utilization_nvidia_smi()
+        if line:
+            return line
+    except Exception:
+        pass
+    return "gpu util unavailable"
+
+
 def format_epoch_line(epoch: int, rows: list[dict[str, str]], val_noise: str) -> str:
     if not rows:
         raise RuntimeError("这一轮没有优化步，不能打印损失")
@@ -808,6 +877,7 @@ def main() -> None:
         with log_path.open("w", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=fields).writeheader()
     torch.manual_seed(args.seed)
+    print(gpu_utilization_line(), flush=True)
     for epoch in range(start_epoch + 1, end_epoch + 1):
         rng = np.random.default_rng([args.seed, epoch])
         order = epoch_order(groups, rng, args.batch_size)
@@ -830,6 +900,7 @@ def main() -> None:
             with log_path.open("a", newline="", encoding="utf-8") as handle:
                 csv.DictWriter(handle, fieldnames=fields).writerow(row)
         print(format_epoch_line(epoch, epoch_rows, val_noise), flush=True)
+        print(gpu_utilization_line(), flush=True)
         if writes_checkpoints(args.smoke) and (epoch % 50 == 0 or epoch == end_epoch):
             save_checkpoint(
                 args.log_dir / f"checkpoint_epoch{epoch:03d}.pt",
@@ -983,12 +1054,12 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "window_dir": str(args.window_dir),
         "pixel_target": "original 256x256 PNG under 06_可打开的窗口小图, packed by image_to_tensor. The stored clean latent is not decoded as the target. ID03 images are not read.",
         "low_noise_fraction": LOW_NOISE_FRACTION,
-        "structure_timestep_gate": "pixel, edge, boundary, and Haar only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step. SSIM and descriptor stay in the map at weight 0.",
+        "structure_timestep_gate": "pixel, edge, boundary, Haar, and descriptor only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step. Descriptor also requires a present window target and no condition drop. SSIM stays in the map at weight 0.",
         "low_noise_fraction_source": "training/diffusion.py getattr(config.loss, descriptor_low_noise_fraction, 0.3), the gate on overlay and descriptor",
         "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
         "mechanics_surrogate": "not constructed",
         "loss_weights": structure_loss_weights(),
-        "loss_weight_source": "Pixel, edge, boundary, and Haar stay on VaeLossWeights (rgb 1.0, edge 0.5, boundary 0.25, haar 0.25). SSIM and descriptor are 0 after the 0.25 and 0.1 runs both looked worse than epoch 1152. SSIM does not use VaeLossWeights.ssim 0.25.",
+        "loss_weight_source": "Pixel, edge, boundary, and Haar stay on VaeLossWeights (rgb 1.0, edge 0.5, boundary 0.25, haar 0.25). SSIM is 0. Descriptor is 0.1. SSIM does not use VaeLossWeights.ssim 0.25.",
         "loss_log": LOSS_LOG_NAME,
         "loss_formula_source": "013代码/src/ebsd_feedback/training/diffusion.py image L1, edge_loss, boundary_loss, haar_loss",
         "yaml_not_in_tree": "06_配置文件/03_基础条件扩散.yaml was not copied. diffusion.py reads config.loss.image/edge/boundary/haar and does not literalize them.",
@@ -1000,7 +1071,6 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         },
         "left_at_zero": {
             "ssim": LOSS_SSIM,
-            "descriptor": LOSS_DESCRIPTOR,
             "unrolled_descriptor": LOSS_UNROLLED_DESCRIPTOR,
             "overlay": LOSS_OVERLAY,
             "orientation": LOSS_ORIENTATION,
