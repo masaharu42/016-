@@ -2,13 +2,20 @@
 """Continue ID03 patch diffusion from the round-1 noise checkpoint the user passes.
 
 Round 1 (train_round1.py) stays noise-only. This script does not replace it.
-Pass --checkpoint. On the server that file is 04_训练日志/checkpoint_epoch200.pt.
+Pass --checkpoint. The next server run is 04_训练日志/checkpoint_epoch1152.pt.
+Any checkpoint whose epoch is the start of this continuation is accepted.
 Do not resume checkpoint_epoch400.pt or checkpoint_epoch600.pt.
 Each invocation does about 20000 optimizer steps and cannot pass that target.
 It does not return to the 80000-step schedule. Batch 16 draws 21 steps per
-epoch, so the default is 952 epochs (19992 steps) and ends at epoch 1152.
-Batch 8 draws 42 steps per epoch, so the default is 476 epochs (19992 steps)
-and ends at epoch 676. Every epoch prints the total and each term, flushed.
+epoch, so the default is 952 more epochs (19992 steps): 1152 through 2104.
+Batch 8 draws 42 steps per epoch, so the default is 476 more epochs and ends
+at epoch 1628. Every epoch prints the total and each term, flushed.
+
+SSIM uses VaeLossWeights.ssim (0.25) on the decoded RGB and the original
+window RGB, and only on the same low-noise steps as the other image terms.
+The descriptor term uses weight 0.25. Its targets are the five per-window
+columns in crops.csv, read by the frozen 013 image-descriptor proxy. A row
+with an empty field is inactive. Unrolled descriptor and overlay stay 0.
 
 Image-structure terms are the four that training/diffusion.py adds on top of
 the noise loss when it decodes (not the VAE-only SSIM, flatness, or KL terms):
@@ -41,10 +48,11 @@ VaeLossWeights.ssim (0.25), flatness (0.05), and kl (1e-6) are VAE-only.
 simple_vae_loss's edge weight 0.2 is not used either: that path zeros
 boundary and Haar, and diffusion.py evaluates all three.
 
-descriptor, unrolled_descriptor, and overlay_alignment stay at the
-getattr default of 0 in diffusion.py. This stage does not load a descriptor
-head and does not add a local descriptor condition. orientation stays 0.
+Unrolled descriptor and overlay stay 0. Orientation stays 0.
 mechanics_weight is 0 and the mechanics surrogate is not constructed.
+The descriptor term is the frozen image proxy in diffusion.py, weight 0.25,
+gated by descriptor_consistency: low noise, and not condition-dropped.
+This continuation also requires the window's own five descriptors.
 diffusion.py itself forces mechanics_weight to 0 unless stage is
 diffusion_feedback.
 
@@ -72,6 +80,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+import math
 import sys
 from pathlib import Path
 
@@ -112,12 +121,18 @@ from train_round1 import (
 )
 
 MECHANICS_LOSS_WEIGHT = 0.0
-LOSS_DESCRIPTOR = 0.0
+# Authorized for this continuation. diffusion.py reads config.loss.descriptor;
+# the yaml was not copied, and its getattr default is 0.
+LOSS_DESCRIPTOR = 0.25
 LOSS_UNROLLED_DESCRIPTOR = 0.0
 LOSS_OVERLAY = 0.0
 LOSS_ORIENTATION = 0.0
-ROUND1_EPOCHS = 200
-# One invocation from the round-1 checkpoint. Whole epochs stay at or under this.
+# diffusion.py: getattr(config.loss, "descriptor_huber_beta", 0.5)
+DESCRIPTOR_HUBER_BETA = 0.5
+# This phase starts from the finished low-noise run. Other epochs are allowed
+# except the rejected 400 and 600 checkpoints. The csv is rewritten here.
+CONTINUATION_START_EPOCH = 1152
+# One invocation. Whole epochs stay at or under this.
 TARGET_OPTIMIZER_STEPS = 20000
 # 013 sizes train_diffusion for max_steps 80000. This fold does not use that length.
 UNUSED_LONG_RUN_STEPS = 80000
@@ -127,10 +142,20 @@ FORBIDDEN_CHECKPOINT_NAMES = ("checkpoint_epoch400.pt", "checkpoint_epoch600.pt"
 # Overlay and descriptor terms use timesteps < int(timesteps * fraction).
 LOW_NOISE_FRACTION = 0.3
 # Existing spot-check folders. A finished run writes a different directory.
-RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600")
-# A new log, so the earlier train_round2_loss.csv on the server stays intact.
-LOSS_LOG_NAME = "train_round2_原图低噪声.csv"
-CONFIG_NAME = "第二轮原图低噪声配置.json"
+RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600", "ID03抽查_epoch1152")
+# A new log, so the earlier round-2 csv files on the server stay intact.
+LOSS_LOG_NAME = "train_round2_ssim描述符.csv"
+CONFIG_NAME = "第二轮ssim描述符配置.json"
+WINDOW_DESCRIPTOR_FIELDS = (
+    "D50",
+    "log_spread",
+    "area_weighted_aspect",
+    "coarse_area_fraction",
+    "boundary_length_density",
+)
+# Finite stand-in for rows that are inactive. descriptor_consistency still
+# transforms the whole tensor; these values are never in the loss.
+_DESCRIPTOR_PLACEHOLDER = (1.0, 1.0, 2.0, 0.5, 0.02)
 
 
 def _import_structure():
@@ -139,19 +164,40 @@ def _import_structure():
         raise FileNotFoundError(f"缺少 013 源码: {pkg}")
     if str(pkg) not in sys.path:
         sys.path.insert(0, str(pkg))
+    from ebsd_feedback.constants import DESCRIPTOR_COLUMNS
     from ebsd_feedback.data import image_to_tensor
-    from ebsd_feedback.losses import VaeLossWeights, boundary_loss, edge_loss, haar_loss
+    from ebsd_feedback.losses import VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss
     from ebsd_feedback.models.vae import BoundaryAwareVAE
-    return VaeLossWeights, boundary_loss, edge_loss, haar_loss, BoundaryAwareVAE, image_to_tensor
+    from ebsd_feedback.training.descriptor_guidance import descriptor_consistency
+    from ebsd_feedback.training.image_descriptor import load_frozen_proxy
+    return (
+        VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss, BoundaryAwareVAE,
+        image_to_tensor, DESCRIPTOR_COLUMNS, descriptor_consistency, load_frozen_proxy,
+    )
 
 
-VaeLossWeights, boundary_loss, edge_loss, haar_loss, BoundaryAwareVAE, image_to_tensor = _import_structure()
+(
+    VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss, BoundaryAwareVAE,
+    image_to_tensor, DESCRIPTOR_COLUMNS, descriptor_consistency, load_frozen_proxy,
+) = _import_structure()
 _STRUCTURE_SOURCE = VaeLossWeights()
+_CANONICAL_DESCRIPTORS = (
+    "grain_size_median_um",
+    "grain_size_log_spread",
+    "area_weighted_aspect_ratio",
+    "coarse_grain_area_fraction",
+    "boundary_length_density_per_um",
+)
+if tuple(DESCRIPTOR_COLUMNS) != _CANONICAL_DESCRIPTORS:
+    raise RuntimeError(f"描述符列应为 {_CANONICAL_DESCRIPTORS}，实际 {tuple(DESCRIPTOR_COLUMNS)}")
+if len(WINDOW_DESCRIPTOR_FIELDS) != len(_CANONICAL_DESCRIPTORS):
+    raise RuntimeError("窗口描述符列和 013 的 DESCRIPTOR_COLUMNS 对不上")
 # Full four-channel L1. Weight is VaeLossWeights.rgb, not the earlier 4.0 trial.
 LOSS_IMAGE = float(_STRUCTURE_SOURCE.rgb)
 LOSS_EDGE = float(_STRUCTURE_SOURCE.edge)
 LOSS_BOUNDARY = float(_STRUCTURE_SOURCE.boundary)
 LOSS_HAAR = float(_STRUCTURE_SOURCE.haar)
+LOSS_SSIM = float(_STRUCTURE_SOURCE.ssim)
 
 
 def structure_loss_weights() -> dict[str, float]:
@@ -160,16 +206,19 @@ def structure_loss_weights() -> dict[str, float]:
         "edge": LOSS_EDGE,
         "boundary": LOSS_BOUNDARY,
         "haar": LOSS_HAAR,
+        "ssim": LOSS_SSIM,
+        "descriptor": LOSS_DESCRIPTOR,
     }
 
 
 def image_structure_losses(decoded: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Same four calls as training/diffusion.py. target is the original window."""
+    """Pixel, edge, boundary, Haar, and RGB SSIM. target is the original window."""
     return {
         "image": F.l1_loss(decoded, target),
         "edge": edge_loss(decoded, target),
         "boundary": boundary_loss(decoded, target),
         "haar": haar_loss(decoded, target),
+        "ssim": ssim_loss(decoded[:, :3], target[:, :3]),
     }
 
 
@@ -196,12 +245,139 @@ def structure_losses_for_timesteps(
     timesteps: torch.Tensor,
     total_timesteps: int,
 ) -> dict[str, torch.Tensor]:
-    """Pixel, edge, boundary, and Haar only on low-noise rows. Others contribute 0."""
+    """Pixel, edge, boundary, Haar, and SSIM only on low-noise rows. Others contribute 0."""
     active = low_noise_mask(timesteps, total_timesteps, LOW_NOISE_FRACTION)
     if not bool(active.any()):
         zero = decoded.sum() * 0.0
-        return {name: zero for name in ("image", "edge", "boundary", "haar")}
+        return {name: zero for name in ("image", "edge", "boundary", "haar", "ssim")}
     return image_structure_losses(decoded[active], target[active])
+
+
+def window_descriptor_batch(rows: list[dict[str, str]]) -> tuple[torch.Tensor, torch.Tensor]:
+    """Physical descriptors in DESCRIPTOR_COLUMNS order, plus a present mask.
+
+    An empty or non-finite field makes that window inactive. The returned
+    values use a finite placeholder on inactive rows so the 013 transform can
+    run; those rows are excluded from the loss.
+    """
+    values = []
+    present = []
+    for row in rows:
+        parsed = []
+        ok = True
+        for name in WINDOW_DESCRIPTOR_FIELDS:
+            text = str(row.get(name, "")).strip()
+            if text == "" or text.lower() == "nan":
+                ok = False
+                parsed.append(float("nan"))
+                continue
+            try:
+                number = float(text)
+            except ValueError:
+                ok = False
+                parsed.append(float("nan"))
+                continue
+            if not math.isfinite(number):
+                ok = False
+            parsed.append(number)
+        values.append(parsed)
+        present.append(ok)
+    tensor = torch.tensor(values, dtype=torch.float32)
+    mask = torch.tensor(present, dtype=torch.bool)
+    if (~mask).any():
+        tensor = tensor.clone()
+        tensor[~mask] = torch.tensor(_DESCRIPTOR_PLACEHOLDER, dtype=torch.float32)
+    return tensor, mask
+
+
+def descriptor_loss_for_batch(
+    predicted_clean: torch.Tensor,
+    decoded_active: torch.Tensor,
+    active: torch.Tensor,
+    timesteps: torch.Tensor,
+    drop_mask: torch.Tensor,
+    targets_physical: torch.Tensor,
+    present: torch.Tensor,
+    head,
+    transform,
+    total_timesteps: int,
+) -> torch.Tensor:
+    """descriptor_consistency on low-noise rows that were not dropped and have descriptors."""
+    full = decoded_active.new_zeros(
+        (predicted_clean.shape[0], *decoded_active.shape[1:])
+    )
+    full = full.index_copy(0, active.nonzero().flatten(), decoded_active)
+    inactive = drop_mask | ~present.to(device=drop_mask.device)
+    loss, _info = descriptor_consistency(
+        predicted_clean,
+        targets_physical.to(device=predicted_clean.device),
+        timesteps,
+        inactive,
+        head,
+        transform,
+        total_timesteps,
+        LOW_NOISE_FRACTION,
+        DESCRIPTOR_HUBER_BETA,
+        full,
+    )
+    return loss
+
+
+def load_frozen_descriptor_proxy(proxy_path: Path, vae_path: Path, train_ids: list[str], device: torch.device):
+    """Load the 013 ID03 image proxy. A missing file or a VAE mismatch is an error."""
+    if not proxy_path.is_file():
+        raise FileNotFoundError(
+            f"缺少冻结的图像描述符代理 {proxy_path}。"
+            "请从 013 的 ID03 折复制 02b_图像描述符代理/图像描述符_最终模型.pt 到 "
+            "07_013各折已有权重/ID03/02b_图像描述符代理/。这一项不能跳过。"
+        )
+    fold = proxy_path.parent.parent
+    standard_proxy = fold / "02b_图像描述符代理" / "图像描述符_最终模型.pt"
+    standard_vae = fold / "01_边界感知VAE" / "VAE_最终模型.pt"
+    if proxy_path.resolve() == standard_proxy.resolve() and vae_path.resolve() == standard_vae.resolve():
+        try:
+            head, transform = load_frozen_proxy(fold, train_ids, device)
+        except FileNotFoundError as exc:
+            raise FileNotFoundError(
+                "缺少和描述符代理配套的 VAE。请从 013 的 ID03 折把 "
+                "图像描述符_最终模型.pt 和 VAE_最终模型.pt 一起复制到 07_013各折已有权重/ID03/。"
+            ) from exc
+        except ValueError as exc:
+            raise RuntimeError(
+                f"图像描述符代理检查没有通过，不能放宽: {exc}。"
+                "请从 013 的 ID03 折复制和这份 VAE 匹配的 图像描述符_最终模型.pt。"
+            ) from exc
+    else:
+        head, transform = _load_proxy_checked(proxy_path, vae_path, train_ids, device)
+    if any(parameter.requires_grad for parameter in head.parameters()):
+        raise RuntimeError("描述符代理必须冻住")
+    head.eval()
+    return head, transform
+
+
+def _load_proxy_checked(proxy_path: Path, vae_path: Path, train_ids: list[str], device: torch.device):
+    """Same checks as load_frozen_proxy when the files are not in the standard fold layout."""
+    from ebsd_feedback.models.descriptor_head import DescriptorTargetTransform, LatentDescriptorHead
+    from ebsd_feedback.training.image_descriptor import sha256
+
+    if not vae_path.is_file():
+        raise FileNotFoundError(
+            f"缺少和描述符代理配套的 VAE {vae_path}。请从 013 的 ID03 折一起复制。"
+        )
+    state = torch.load(proxy_path, map_location="cpu", weights_only=False)
+    if state.get("schema") != "013_image_proxy_v1" or state.get("holdout_id") != HOLDOUT:
+        raise RuntimeError("013描述符代理检查点格式/留出折错误。需要 ID03 折的 013_image_proxy_v1。")
+    if set(state["train_ids"]) != set(train_ids) or HOLDOUT in set(train_ids):
+        raise RuntimeError("描述符代理训练ID不符")
+    if state["vae_sha256"] != sha256(vae_path):
+        raise RuntimeError(
+            "描述符代理使用的VAE已变化，请在新的实验目录重训。"
+            "检查没有放宽。请从 013 的 ID03 折复制和这份 VAE 匹配的 图像描述符_最终模型.pt。"
+        )
+    head = LatentDescriptorHead(**state["model_config"]).to(device)
+    head.load_state_dict(state["model"])
+    transform = DescriptorTargetTransform.from_state_dict(state["transform"])
+    return head.eval().requires_grad_(False), transform
 
 
 def window_png_path(window_dir: Path, row: dict[str, str]) -> Path:
@@ -236,17 +412,19 @@ def diffusion_structure_total(
 ) -> torch.Tensor:
     if MECHANICS_LOSS_WEIGHT != 0.0:
         raise RuntimeError("第二轮 MECHANICS_LOSS_WEIGHT 必须是 0，不跑力学代理。")
-    if LOSS_DESCRIPTOR != 0.0 or LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0 or LOSS_ORIENTATION != 0.0:
-        raise RuntimeError("描述符、展开描述符、叠加、取向这一轮权重必须是 0。")
-    expected = {"image", "edge", "boundary", "haar"}
+    if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0 or LOSS_ORIENTATION != 0.0:
+        raise RuntimeError("展开描述符、叠加、取向这一轮权重必须是 0。")
+    expected = {"image", "edge", "boundary", "haar", "ssim", "descriptor"}
     if set(parts) != expected:
-        raise RuntimeError(f"结构损失只算像素、边缘、晶界、Haar，实际 {sorted(parts)}")
+        raise RuntimeError(f"结构损失项不对，实际 {sorted(parts)}")
     return (
         LOSS_NOISE * loss_noise
         + LOSS_IMAGE * parts["image"]
         + LOSS_EDGE * parts["edge"]
         + LOSS_BOUNDARY * parts["boundary"]
         + LOSS_HAAR * parts["haar"]
+        + LOSS_SSIM * parts["ssim"]
+        + LOSS_DESCRIPTOR * parts["descriptor"]
     )
 
 
@@ -268,7 +446,7 @@ def default_extra_epochs(batch_size: int) -> int:
 
 
 def resolve_epoch_range(start_epoch: int, extra_epochs: int, batch_size: int) -> tuple[int, int]:
-    """Start at the round-1 noise checkpoint. One invocation stays within 20000 steps."""
+    """Continue from the checkpoint epoch. One invocation stays within 20000 steps."""
     per_epoch = optimizer_steps_per_epoch(batch_size)
     if extra_epochs < 1:
         raise RuntimeError("至少再训 1 轮")
@@ -286,12 +464,10 @@ def resolve_epoch_range(start_epoch: int, extra_epochs: int, batch_size: int) ->
         )
     if start_epoch in FORBIDDEN_START_EPOCHS:
         raise RuntimeError(
-            "不要从第 400 轮或第 600 轮继续。把 --checkpoint 指到第一轮噪声断点，第 200 轮。"
+            "不要从第 400 轮或第 600 轮继续。下一次从 04_训练日志/checkpoint_epoch1152.pt 开始。"
         )
-    if start_epoch != ROUND1_EPOCHS:
-        raise RuntimeError(
-            f"这一次从第一轮噪声断点第 {ROUND1_EPOCHS} 轮开始，实际第 {start_epoch} 轮。"
-        )
+    if start_epoch < 1:
+        raise RuntimeError(f"断点轮次必须是正数，实际第 {start_epoch} 轮。")
     return start_epoch, start_epoch + extra_epochs
 
 
@@ -299,12 +475,15 @@ def assert_round1_checkpoint(path: Path, start_epoch: int) -> None:
     if path.name in FORBIDDEN_CHECKPOINT_NAMES or start_epoch in FORBIDDEN_START_EPOCHS:
         raise RuntimeError(
             "不要从 checkpoint_epoch400.pt 或 checkpoint_epoch600.pt 继续。"
-            "把 --checkpoint 指到 04_训练日志/checkpoint_epoch200.pt。"
+            "把 --checkpoint 指到 04_训练日志/checkpoint_epoch1152.pt。"
         )
-    if start_epoch != ROUND1_EPOCHS:
-        raise RuntimeError(
-            f"载入的断点是第 {start_epoch} 轮。这一次要用第一轮噪声断点第 {ROUND1_EPOCHS} 轮。"
-        )
+    if start_epoch < 1:
+        raise RuntimeError(f"载入的断点是第 {start_epoch} 轮。需要一份已经训过的断点。")
+
+
+def should_rewrite_loss_log(start_epoch: int, log_exists: bool) -> bool:
+    """Rewrite the phase csv when this continuation starts at epoch 1152."""
+    return start_epoch == CONTINUATION_START_EPOCH or not log_exists
 
 
 def writes_checkpoints(smoke: bool) -> bool:
@@ -374,7 +553,7 @@ def _restore_ema(ema: ExponentialMovingAverage, saved: dict, device: torch.devic
         ema.shadow[name].copy_(value.to(device=device, dtype=ema.shadow[name].dtype))
 
 
-def save_checkpoint(path: Path, model, ema, optimizer, epoch: int, step: int, values: torch.Tensor, resumed_from: str) -> None:
+def save_checkpoint(path: Path, model, ema, optimizer, epoch: int, step: int, values: torch.Tensor, resumed_from: str, resumed_from_epoch: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
         {
@@ -396,11 +575,14 @@ def save_checkpoint(path: Path, model, ema, optimizer, epoch: int, step: int, va
             "condition_dropout": CONDITION_DROPOUT,
             "round": 2,
             "resumed_from": resumed_from,
+            "resumed_from_epoch": resumed_from_epoch,
+            "continuation_start_epoch": CONTINUATION_START_EPOCH,
             "loss_noise_weight": LOSS_NOISE,
             "loss_image_weight": LOSS_IMAGE,
             "loss_edge_weight": LOSS_EDGE,
             "loss_boundary_weight": LOSS_BOUNDARY,
             "loss_haar_weight": LOSS_HAAR,
+            "loss_ssim_weight": LOSS_SSIM,
             "loss_descriptor_weight": LOSS_DESCRIPTOR,
             "loss_unrolled_descriptor_weight": LOSS_UNROLLED_DESCRIPTOR,
             "loss_overlay_weight": LOSS_OVERLAY,
@@ -419,7 +601,13 @@ def parse_args() -> argparse.Namespace:
         "--checkpoint",
         type=Path,
         required=True,
-        help="Round-1 noise checkpoint passed by the user. Not stored in git. On the server: 04_训练日志/checkpoint_epoch200.pt. Do not pass checkpoint_epoch400.pt or checkpoint_epoch600.pt.",
+        help="Checkpoint to resume. Not stored in git. Next server run: 04_训练日志/checkpoint_epoch1152.pt. Do not pass checkpoint_epoch400.pt or checkpoint_epoch600.pt.",
+    )
+    parser.add_argument(
+        "--descriptor-proxy",
+        type=Path,
+        default=root / "07_013各折已有权重" / "ID03" / "02b_图像描述符代理" / "图像描述符_最终模型.pt",
+        help="Frozen 013 ID03 image-descriptor proxy. Copy it from the 013 ID03 fold if it is missing.",
     )
     parser.add_argument("--latent-dir", type=Path, default=root / "02_整图潜变量_八个视角")
     parser.add_argument(
@@ -480,7 +668,8 @@ def format_epoch_line(epoch: int, rows: list[dict[str, str]], val_noise: str) ->
         f"epoch {epoch} train_total {mean('loss_total'):.4f} "
         f"noise {mean('loss_noise'):.4f} image {mean('loss_image'):.4f} "
         f"edge {mean('loss_edge'):.4f} boundary {mean('loss_boundary'):.4f} "
-        f"haar {mean('loss_haar'):.4f} val_noise {val_noise}"
+        f"haar {mean('loss_haar'):.4f} ssim {mean('loss_ssim'):.4f} "
+        f"descriptor {mean('loss_descriptor'):.4f} val_noise {val_noise}"
     )
 
 
@@ -497,6 +686,10 @@ def main() -> None:
         raise RuntimeError(f"结构损失项不对: {list(weights)}")
     if weights["image"] != float(_STRUCTURE_SOURCE.rgb):
         raise RuntimeError("四通道像素 L1 权重必须是 VaeLossWeights.rgb，也就是 1.0")
+    if weights["ssim"] != float(_STRUCTURE_SOURCE.ssim) or weights["descriptor"] != 0.25:
+        raise RuntimeError("SSIM 和描述符权重必须是 0.25")
+    if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0:
+        raise RuntimeError("展开描述符和叠加必须是 0")
     if not args.window_dir.is_dir():
         raise FileNotFoundError(f"缺少训练窗口原图目录 {args.window_dir}")
     if (weights["edge"], weights["boundary"], weights["haar"]) != (
@@ -517,7 +710,11 @@ def main() -> None:
         raise RuntimeError(f"这些合金没有 28 维条件: {missing_cond}")
     if any(row["alloy_id"] == HOLDOUT for row in crops):
         raise RuntimeError("crops.csv 里不该有 ID03")
+    train_ids = sorted(groups)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    descriptor_head, descriptor_transform = load_frozen_descriptor_proxy(
+        args.descriptor_proxy, args.vae, train_ids, device,
+    )
     precision = "bf16" if device.type == "cuda" else "fp32"
     state = _load_checkpoint(args.checkpoint, device)
     start_epoch = int(state["epoch"])
@@ -540,6 +737,7 @@ def main() -> None:
         f"checkpoint={args.checkpoint} "
         f"lr={LEARNING_RATE} betas={ADAMW_BETAS} "
         f"loss_image={LOSS_IMAGE} loss_edge={LOSS_EDGE} loss_boundary={LOSS_BOUNDARY} loss_haar={LOSS_HAAR} "
+        f"loss_ssim={LOSS_SSIM} loss_descriptor={LOSS_DESCRIPTOR} "
         f"low_noise_fraction={LOW_NOISE_FRACTION} window_dir={args.window_dir} "
         f"mechanics_weight={MECHANICS_LOSS_WEIGHT}",
         flush=True,
@@ -568,7 +766,10 @@ def main() -> None:
     if args.smoke:
         if writes_checkpoints(True) or writes_id03_images(True):
             raise RuntimeError("smoke 不写断点，也不写 ID03 图")
-        _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, args.window_dir, device, precision, step)
+        _smoke_step(
+            args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map,
+            args.window_dir, descriptor_head, descriptor_transform, device, precision, step,
+        )
         return
     val_rows = [row for row in read_table(args.val_strip) if row["alloy_id"] != HOLDOUT]
     if not val_rows:
@@ -587,9 +788,9 @@ def main() -> None:
     log_path = args.log_dir / LOSS_LOG_NAME
     fields = [
         "epoch", "step", "loss_total", "loss_noise", "loss_image", "loss_edge",
-        "loss_boundary", "loss_haar", "loss_mechanics", "val_noise",
+        "loss_boundary", "loss_haar", "loss_ssim", "loss_descriptor", "loss_mechanics", "val_noise",
     ]
-    if start_epoch == ROUND1_EPOCHS or not log_path.is_file():
+    if should_rewrite_loss_log(start_epoch, log_path.is_file()):
         with log_path.open("w", newline="", encoding="utf-8") as handle:
             csv.DictWriter(handle, fieldnames=fields).writeheader()
     torch.manual_seed(args.seed)
@@ -602,7 +803,8 @@ def main() -> None:
         for start in range(0, len(order), args.batch_size):
             batch_rows = [crops[int(i)] for i in order[start:start + args.batch_size]]
             step, row = _optimizer_step(
-                model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, args.window_dir, device, precision, step,
+                model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, args.window_dir,
+                descriptor_head, descriptor_transform, device, precision, step,
             )
             is_last = start + args.batch_size >= len(order)
             if is_last:
@@ -617,7 +819,7 @@ def main() -> None:
         if writes_checkpoints(args.smoke) and (epoch % 50 == 0 or epoch == end_epoch):
             save_checkpoint(
                 args.log_dir / f"checkpoint_epoch{epoch:03d}.pt",
-                model, ema, optimizer, epoch, step, cond_values, str(args.checkpoint),
+                model, ema, optimizer, epoch, step, cond_values, str(args.checkpoint), start_epoch,
             )
             print(f"saved checkpoint_epoch{epoch:03d}.pt", flush=True)
     if writes_id03_images(args.smoke):
@@ -628,15 +830,20 @@ def main() -> None:
         write_heldout_samples(final_checkpoint, args.vae, sample_dir, args.seed)
 
 
-def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, window_dir, device, precision, step):
+def _optimizer_step(
+    model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, window_dir,
+    descriptor_head, descriptor_transform, device, precision, step,
+):
     latent = crop_batch(store, batch_rows).to(device, non_blocking=True)
     condition = torch.stack([cond_map[row["alloy_id"]] for row in batch_rows], 0).to(device, non_blocking=True)
     target = load_original_batch(window_dir, batch_rows).to(device, non_blocking=True)
+    descriptor_values, descriptor_present = window_descriptor_batch(batch_rows)
     noise = torch.randn_like(latent)
     timesteps = torch.randint(0, schedule.timesteps, (latent.shape[0],), device=device)
     noisy = schedule.add_noise(latent, noise, timesteps)
     drop = torch.rand(latent.shape[0], device=device) < CONDITION_DROPOUT
     optimizer.zero_grad(set_to_none=True)
+    descriptor_head.eval()
     with _autocast(precision):
         predicted = model(noisy, timesteps, condition, drop)
         loss_noise = noise_loss(schedule, predicted, noise, timesteps)
@@ -646,9 +853,14 @@ def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, con
         if bool(active.any()):
             decoded = vae.decode(predicted_clean[active] / LATENT_SCALE)
             parts = image_structure_losses(decoded, target[active].to(dtype=decoded.dtype))
+            parts["descriptor"] = descriptor_loss_for_batch(
+                predicted_clean, decoded, active, timesteps, drop,
+                descriptor_values, descriptor_present, descriptor_head, descriptor_transform,
+                int(schedule.timesteps),
+            )
         else:
             zero = predicted_clean.sum() * 0.0
-            parts = {name: zero for name in ("image", "edge", "boundary", "haar")}
+            parts = {name: zero for name in ("image", "edge", "boundary", "haar", "ssim", "descriptor")}
     total = diffusion_structure_total(loss_noise, parts)
     if not bool(torch.isfinite(total)):
         raise RuntimeError("第二轮损失出现 NaN/Inf")
@@ -666,6 +878,8 @@ def _optimizer_step(model, schedule, vae, optimizer, ema, store, batch_rows, con
         "loss_edge": f"{float(parts['edge'].detach()):.8f}",
         "loss_boundary": f"{float(parts['boundary'].detach()):.8f}",
         "loss_haar": f"{float(parts['haar'].detach()):.8f}",
+        "loss_ssim": f"{float(parts['ssim'].detach()):.8f}",
+        "loss_descriptor": f"{float(parts['descriptor'].detach()):.8f}",
         "loss_mechanics": "0.0",
         "val_noise": "",
     }
@@ -694,18 +908,23 @@ def write_heldout_samples(checkpoint: Path, vae_path: Path, out_dir: Path, seed:
     return out_dir
 
 
-def _smoke_step(args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, window_dir, device, precision, step) -> None:
+def _smoke_step(
+    args, model, schedule, vae, optimizer, ema, store, crops, groups, cond_map, window_dir,
+    descriptor_head, descriptor_transform, device, precision, step,
+) -> None:
     rng = np.random.default_rng([args.seed, int(args.epochs)])
     order = epoch_order(groups, rng, args.batch_size)
     batch_rows = [crops[int(i)] for i in order[: args.batch_size]]
     model.train()
     new_step, row = _optimizer_step(
-        model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, window_dir, device, precision, step,
+        model, schedule, vae, optimizer, ema, store, batch_rows, cond_map, window_dir,
+        descriptor_head, descriptor_transform, device, precision, step,
     )
     print(
         f"smoke_ok step={new_step} loss_total={row['loss_total']} loss_noise={row['loss_noise']} "
         f"loss_image={row['loss_image']} loss_edge={row['loss_edge']} "
         f"loss_boundary={row['loss_boundary']} loss_haar={row['loss_haar']} "
+        f"loss_ssim={row['loss_ssim']} loss_descriptor={row['loss_descriptor']} "
         f"loss_mechanics={row['loss_mechanics']} window={batch_rows[0]['alloy_id']}_{batch_rows[0]['view']}",
         flush=True,
     )
@@ -717,7 +936,12 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "round": 2,
         "holdout": HOLDOUT,
         "checkpoint": str(args.checkpoint),
-        "checkpoint_note": "passed by the user; not in git. Resume 04_训练日志/checkpoint_epoch200.pt. Leave checkpoint_epoch400.pt and checkpoint_epoch600.pt unused.",
+        "checkpoint_note": "passed by the user; not in git. Resume 04_训练日志/checkpoint_epoch1152.pt. Leave checkpoint_epoch400.pt and checkpoint_epoch600.pt unused.",
+        "continuation_start_epoch": CONTINUATION_START_EPOCH,
+        "resumed_from_epoch": start_epoch,
+        "descriptor_proxy": str(args.descriptor_proxy),
+        "descriptor_huber_beta": DESCRIPTOR_HUBER_BETA,
+        "descriptor_target": "per-window crops.csv fields D50, log_spread, area_weighted_aspect, coarse_area_fraction, boundary_length_density. Empty rows are inactive.",
         "start_epoch": start_epoch,
         "end_epoch": end_epoch,
         "extra_epochs": end_epoch - start_epoch,
@@ -750,7 +974,7 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
         "mechanics_surrogate": "not constructed",
         "loss_weights": structure_loss_weights(),
-        "loss_weight_source": "losses.py VaeLossWeights rgb 1.0, edge 0.5, boundary 0.25, haar 0.25. The pixel weight 4.0 trial is not used.",
+        "loss_weight_source": "losses.py VaeLossWeights rgb 1.0, ssim 0.25, edge 0.5, boundary 0.25, haar 0.25. Descriptor weight is 0.25 for this continuation. The pixel weight 4.0 trial is not used.",
         "loss_log": LOSS_LOG_NAME,
         "loss_formula_source": "013代码/src/ebsd_feedback/training/diffusion.py image L1, edge_loss, boundary_loss, haar_loss",
         "yaml_not_in_tree": "06_配置文件/03_基础条件扩散.yaml was not copied. diffusion.py reads config.loss.image/edge/boundary/haar and does not literalize them.",

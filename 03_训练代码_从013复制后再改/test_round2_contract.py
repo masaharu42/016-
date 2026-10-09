@@ -21,7 +21,10 @@ sys.path.insert(0, str(PKG))
 
 import train_round1
 import train_round2
-from ebsd_feedback.losses import VaeLossWeights, boundary_loss, edge_loss, haar_loss
+from ebsd_feedback.losses import VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss
+from ebsd_feedback.models.descriptor_head import DescriptorTargetTransform, LatentDescriptorHead
+from ebsd_feedback.training.descriptor_guidance import descriptor_consistency
+from ebsd_feedback.training.image_descriptor import sha256
 from ebsd_feedback.models.vae import BoundaryAwareVAE
 
 
@@ -51,15 +54,19 @@ class Round2Contract(unittest.TestCase):
         self.assertEqual(train_round2.LOSS_EDGE, float(source.edge))
         self.assertEqual(train_round2.LOSS_BOUNDARY, float(source.boundary))
         self.assertEqual(train_round2.LOSS_HAAR, float(source.haar))
+        self.assertEqual(train_round2.LOSS_SSIM, float(source.ssim))
+        self.assertEqual(train_round2.LOSS_SSIM, 0.25)
+        self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.25)
         self.assertEqual(train_round2.structure_loss_weights(), {
             "image": 1.0,
             "edge": 0.5,
             "boundary": 0.25,
             "haar": 0.25,
+            "ssim": 0.25,
+            "descriptor": 0.25,
         })
         self.assertEqual(train_round2.LOSS_NOISE, 1.0)
         self.assertEqual(train_round2.MECHANICS_LOSS_WEIGHT, 0.0)
-        self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.0)
         self.assertEqual(train_round2.LOSS_UNROLLED_DESCRIPTOR, 0.0)
         self.assertEqual(train_round2.LOSS_OVERLAY, 0.0)
         self.assertEqual(train_round2.LOSS_ORIENTATION, 0.0)
@@ -68,17 +75,23 @@ class Round2Contract(unittest.TestCase):
         self.assertEqual(float(source.kl), 1e-6)
         text = (ROOT / "train_round2.py").read_text(encoding="utf-8")
         self.assertNotIn("EbsdMechanicsSurrogate", text)
-        self.assertNotIn("ssim_loss(", text)
         self.assertNotIn("intragranular_flatness_loss(", text)
         self.assertIs(train_round2.edge_loss, edge_loss)
         self.assertIs(train_round2.boundary_loss, boundary_loss)
         self.assertIs(train_round2.haar_loss, haar_loss)
+        self.assertIs(train_round2.ssim_loss, ssim_loss)
+        self.assertIs(train_round2.descriptor_consistency, descriptor_consistency)
+        self.assertIn(
+            "ssim_loss(decoded[:, :3], target[:, :3])",
+            inspect.getsource(train_round2.image_structure_losses),
+        )
 
     def test_structure_total_is_noise_plus_four_terms(self):
         decoded = torch.rand(2, 4, 32, 32, requires_grad=True)
         target = torch.rand(2, 4, 32, 32)
         parts = train_round2.image_structure_losses(decoded, target)
-        self.assertEqual(set(parts), {"image", "edge", "boundary", "haar"})
+        parts["descriptor"] = decoded.sum() * 0.0
+        self.assertEqual(set(parts), {"image", "edge", "boundary", "haar", "ssim", "descriptor"})
         noise = torch.tensor(0.3)
         total = train_round2.diffusion_structure_total(noise, parts)
         expected = (
@@ -87,6 +100,8 @@ class Round2Contract(unittest.TestCase):
             + 0.5 * parts["edge"]
             + 0.25 * parts["boundary"]
             + 0.25 * parts["haar"]
+            + 0.25 * parts["ssim"]
+            + 0.25 * parts["descriptor"]
         )
         self.assertTrue(torch.allclose(total, expected))
         self.assertTrue(torch.isfinite(total))
@@ -99,6 +114,7 @@ class Round2Contract(unittest.TestCase):
         latent = torch.randn(1, 4, 8, 8, requires_grad=True)
         decoded = vae.decode(latent)
         parts = train_round2.image_structure_losses(decoded, torch.zeros_like(decoded))
+        parts["descriptor"] = decoded.sum() * 0.0
         total = train_round2.diffusion_structure_total(decoded.new_zeros(()), parts)
         total.backward()
         self.assertGreater(float(latent.grad.abs().sum()), 0.0)
@@ -117,11 +133,14 @@ class Round2Contract(unittest.TestCase):
         self.assertLessEqual(476 * 42, 20000)
         self.assertGreater(953 * 21, 20000)
         self.assertGreater(477 * 42, 20000)
+        self.assertEqual(train_round2.resolve_epoch_range(1152, 952, 16), (1152, 2104))
+        self.assertEqual(train_round2.resolve_epoch_range(1152, 476, 8), (1152, 1628))
         self.assertEqual(train_round2.resolve_epoch_range(200, 952, 16), (200, 1152))
-        self.assertEqual(train_round2.resolve_epoch_range(200, 476, 8), (200, 676))
-        self.assertEqual(train_round2.resolve_epoch_range(200, 1, 16), (200, 201))
+        self.assertEqual(train_round2.resolve_epoch_range(250, 1, 16), (250, 251))
+        train_round2.assert_round1_checkpoint(Path("checkpoint_epoch1152.pt"), 1152)
         train_round2.assert_round1_checkpoint(Path("checkpoint_epoch200.pt"), 200)
-        for start in (199, 250, 400, 600):
+        train_round2.assert_round1_checkpoint(Path("checkpoint_epoch250.pt"), 250)
+        for start in (400, 600):
             with self.assertRaises(RuntimeError):
                 train_round2.resolve_epoch_range(start, 1, 16)
         with self.assertRaises(RuntimeError):
@@ -136,8 +155,11 @@ class Round2Contract(unittest.TestCase):
             train_round2.assert_round1_checkpoint(Path("checkpoint_epoch400.pt"), 400)
         with self.assertRaises(RuntimeError):
             train_round2.assert_round1_checkpoint(Path("checkpoint_epoch600.pt"), 600)
-        with self.assertRaises(RuntimeError):
-            train_round2.assert_round1_checkpoint(Path("checkpoint_epoch250.pt"), 250)
+        self.assertTrue(train_round2.should_rewrite_loss_log(1152, True))
+        self.assertFalse(train_round2.should_rewrite_loss_log(1600, True))
+        self.assertTrue(train_round2.should_rewrite_loss_log(1600, False))
+        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_ssim描述符.csv")
+        self.assertIn("ID03抽查_epoch1152", train_round2.RESERVED_SAMPLE_DIRS)
         train_round2.check_batch_size(16)
         train_round2.check_batch_size(8)
         with self.assertRaises(RuntimeError):
@@ -155,6 +177,8 @@ class Round2Contract(unittest.TestCase):
                 "loss_edge": "0.3",
                 "loss_boundary": "0.2",
                 "loss_haar": "0.1",
+                "loss_ssim": "0.4",
+                "loss_descriptor": "0.2",
             },
             {
                 "loss_total": "0.5",
@@ -163,13 +187,16 @@ class Round2Contract(unittest.TestCase):
                 "loss_edge": "0.1",
                 "loss_boundary": "0.0",
                 "loss_haar": "0.1",
+                "loss_ssim": "0.2",
+                "loss_descriptor": "0.0",
             },
         ]
         line = train_round2.format_epoch_line(201, rows, "0.12345678")
         self.assertEqual(
             line,
             "epoch 201 train_total 1.0000 noise 0.1000 image 0.3000 "
-            "edge 0.2000 boundary 0.1000 haar 0.1000 val_noise 0.12345678",
+            "edge 0.2000 boundary 0.1000 haar 0.1000 ssim 0.3000 "
+            "descriptor 0.1000 val_noise 0.12345678",
         )
         main = inspect.getsource(train_round2.main)
         self.assertIn("enable_live_stdout()", main)
@@ -210,6 +237,7 @@ print(_image_mode())
         decoded = torch.zeros(4, 4, 16, 16, requires_grad=True)
         target = torch.ones(4, 4, 16, 16)
         parts = train_round2.structure_losses_for_timesteps(decoded, target, timesteps, 1000)
+        parts["descriptor"] = decoded.sum() * 0.0
         total = train_round2.diffusion_structure_total(torch.tensor(0.2), parts)
         total.backward()
         self.assertIsNotNone(decoded.grad)
@@ -220,16 +248,19 @@ print(_image_mode())
         high = torch.tensor([300, 900])
         quiet = torch.rand(2, 4, 16, 16, requires_grad=True)
         quiet_parts = train_round2.structure_losses_for_timesteps(quiet, torch.rand_like(quiet), high, 1000)
+        quiet_parts["descriptor"] = quiet.sum() * 0.0
         noise = torch.tensor(0.4)
         quiet_total = train_round2.diffusion_structure_total(noise, quiet_parts)
         self.assertTrue(torch.allclose(quiet_total, noise))
-        for name in ("image", "edge", "boundary", "haar"):
+        for name in ("image", "edge", "boundary", "haar", "ssim"):
             self.assertEqual(float(quiet_parts[name].detach()), 0.0)
 
     def test_pixel_target_is_original_window(self):
         source = inspect.getsource(train_round2._optimizer_step)
         self.assertIn("low_noise_mask", source)
         self.assertIn("load_original_batch", source)
+        self.assertIn("descriptor_loss_for_batch", source)
+        self.assertIn("descriptor_consistency", inspect.getsource(train_round2.descriptor_loss_for_batch))
         self.assertIn("vae.decode(predicted_clean[active] / LATENT_SCALE)", source)
         self.assertNotIn("vae.decode(latent", source)
         self.assertNotIn(".bmp", source)
@@ -241,6 +272,8 @@ print(_image_mode())
         self.assertIn("assert_round1_checkpoint", main)
         self.assertNotIn("train_round2_loss.csv", main)
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_loss.csv")
+        self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_原图低噪声.csv")
+        self.assertIn("should_rewrite_loss_log", main)
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             alloy_dir = root / "ID01"
@@ -277,9 +310,13 @@ print(_image_mode())
             self.assertEqual(fresh.name, "ID03抽查_epoch400")
             blocked = train_round2.heldout_sample_dir(log_dir, 600)
             self.assertEqual(blocked.name, "ID03抽查_epoch600_1")
+            kept = train_round2.heldout_sample_dir(log_dir, 1152)
+            self.assertEqual(kept.name, "ID03抽查_epoch1152_1")
+            finished = train_round2.heldout_sample_dir(log_dir, 2104)
+            self.assertEqual(finished.name, "ID03抽查_epoch2104")
             self.assertFalse(blocked.exists())
             for name in train_round2.RESERVED_SAMPLE_DIRS:
-                self.assertIn(name, ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600"))
+                self.assertIn(name, ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600", "ID03抽查_epoch1152"))
                 self.assertNotEqual(fresh.name, name)
                 self.assertNotEqual(blocked.name, name)
             (log_dir / "ID03抽查").mkdir()
@@ -311,6 +348,114 @@ print(_image_mode())
         self.assertIn("required=True", parser_source)
         self.assertNotIn("checkpoint_epoch200.pt", parser_source.split("help=")[0])
         self.assertNotIn("checkpoint_epoch400.pt", parser_source.split("help=")[0])
+
+    def test_descriptor_uses_window_values_and_requires_matching_proxy(self):
+        rows = [
+            {
+                "D50": "5.0",
+                "log_spread": "0.3",
+                "area_weighted_aspect": "1.8",
+                "coarse_area_fraction": "0.95",
+                "boundary_length_density": "0.02",
+            },
+            {
+                "D50": "",
+                "log_spread": "0.3",
+                "area_weighted_aspect": "1.8",
+                "coarse_area_fraction": "0.95",
+                "boundary_length_density": "0.02",
+            },
+            {
+                "D50": "nan",
+                "log_spread": "0.3",
+                "area_weighted_aspect": "1.8",
+                "coarse_area_fraction": "0.95",
+                "boundary_length_density": "0.02",
+            },
+        ]
+        values, present = train_round2.window_descriptor_batch(rows)
+        self.assertEqual(present.tolist(), [True, False, False])
+        self.assertTrue(torch.allclose(
+            values[0],
+            torch.tensor([5.0, 0.3, 1.8, 0.95, 0.02]),
+        ))
+        self.assertTrue(torch.isfinite(values[1]).all())
+        self.assertTrue(torch.isfinite(values[2]).all())
+        with self.assertRaises(FileNotFoundError) as missing:
+            train_round2.load_frozen_descriptor_proxy(
+                Path("/tmp/no-such-016-proxy.pt"),
+                Path("/tmp/no-such-016-vae.pt"),
+                ["ID01"],
+                torch.device("cpu"),
+            )
+        self.assertIn("013", str(missing.exception))
+        self.assertIn("ID03", str(missing.exception))
+        fitted = torch.tensor(
+            [
+                [5.0, 0.3, 1.8, 0.95, 0.02],
+                [6.0, 0.4, 1.75, 0.96, 0.03],
+                [4.5, 0.2, 1.7, 0.94, 0.01],
+                [7.0, 0.5, 1.82, 0.97, 0.04],
+            ],
+            dtype=torch.float32,
+        )
+        transform = DescriptorTargetTransform.fit(fitted)
+        head = LatentDescriptorHead(latent_channels=3, hidden_dim=16, output_dim=5).eval()
+        head.requires_grad_(False)
+        decoded = torch.rand(2, 4, 32, 32, requires_grad=True)
+        loss = train_round2.descriptor_loss_for_batch(
+            torch.zeros(2, 4, 4, 4),
+            decoded,
+            torch.tensor([True, True]),
+            torch.tensor([10, 10]),
+            torch.tensor([False, True]),
+            fitted[:2],
+            torch.tensor([True, True]),
+            head,
+            transform,
+            1000,
+        )
+        loss.backward()
+        self.assertGreater(float(decoded.grad[0].abs().sum()), 0.0)
+        self.assertEqual(float(decoded.grad[1].abs().sum()), 0.0)
+        self.assertTrue(all(parameter.grad is None for parameter in head.parameters()))
+        with tempfile.TemporaryDirectory() as tmp:
+            fold = Path(tmp) / "ID03"
+            proxy = fold / "02b_图像描述符代理" / "图像描述符_最终模型.pt"
+            vae = fold / "01_边界感知VAE" / "VAE_最终模型.pt"
+            proxy.parent.mkdir(parents=True)
+            vae.parent.mkdir(parents=True)
+            vae.write_bytes(b"vae-bytes-that-do-not-match")
+            torch.save(
+                {
+                    "schema": "013_image_proxy_v1",
+                    "holdout_id": "ID03",
+                    "train_ids": ["ID01"],
+                    "vae_sha256": "0" * 64,
+                },
+                proxy,
+            )
+            with self.assertRaises(RuntimeError) as mismatched:
+                train_round2.load_frozen_descriptor_proxy(proxy, vae, ["ID01"], torch.device("cpu"))
+            self.assertIn("VAE已变化", str(mismatched.exception))
+            digest = sha256(vae)
+            torch.save(
+                {
+                    "schema": "013_image_proxy_v1",
+                    "holdout_id": "ID03",
+                    "train_ids": ["ID01"],
+                    "vae_sha256": digest,
+                    "model_config": head.config(),
+                    "model": head.state_dict(),
+                    "transform": transform.state_dict(),
+                },
+                proxy,
+            )
+            loaded, loaded_transform = train_round2.load_frozen_descriptor_proxy(
+                proxy, vae, ["ID01"], torch.device("cpu"),
+            )
+            self.assertTrue(all(not parameter.requires_grad for parameter in loaded.parameters()))
+            self.assertEqual(tuple(loaded_transform.columns), tuple(train_round2.DESCRIPTOR_COLUMNS))
 
     def test_round2_module_does_not_rewrite_round1_ast(self):
         round1_tree = ast.parse((ROOT / "train_round1.py").read_text(encoding="utf-8"))
