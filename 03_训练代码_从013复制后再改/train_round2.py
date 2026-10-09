@@ -11,9 +11,9 @@ epoch, so the default is 952 more epochs (19992 steps): 1152 through 2104.
 Batch 8 draws 42 steps per epoch, so the default is 476 more epochs and ends
 at epoch 1628. Every epoch prints the total, each term, and one GPU utilization sample, flushed.
 
-SSIM stays in the six-term map at weight 0. The 0.25 and 0.1 SSIM runs
-softened boundaries, so SSIM stays off. The descriptor term is 0.1.
-VaeLossWeights.ssim stays 0.25 in the dataclass and is not used.
+SSIM and the descriptor stay in the six-term map at weight 0. The boundary
+weight is 0.5, not VaeLossWeights.boundary 0.25. Image stays 1.0, edge 0.5,
+Haar 0.25. VaeLossWeights.ssim stays 0.25 in the dataclass and is not used.
 Unrolled descriptor and overlay stay 0.
 
 Image-structure terms are the four that training/diffusion.py adds on top of
@@ -40,19 +40,19 @@ boundary, and Haar terms are VaeLossWeights in losses.py:
   rgb 1.0, edge 0.5, boundary 0.25, haar 0.25
 
 loss.image multiplies a full four-channel L1. The pixel weight is
-VaeLossWeights.rgb (1.0). Edge, boundary, and Haar stay on VaeLossWeights.
+VaeLossWeights.rgb (1.0). Edge and Haar stay on VaeLossWeights. The trained
+boundary weight is 0.5, not VaeLossWeights.boundary 0.25.
 The 0.75/0.25 channel mix inside boundary_aware_vae_loss is not what
 diffusion.py applies, so it is not used. The pixel weight is not 4.0.
 VaeLossWeights.ssim is 0.25 in the dataclass. The diffusion loss overrides
-that and multiplies ssim_loss by 0. Flatness (0.05) and kl (1e-6) stay out.
+that and multiplies ssim_loss by 0. The descriptor weight is also 0.
+Flatness (0.05) and kl (1e-6) stay out.
 simple_vae_loss's edge weight 0.2 is not used either: that path zeros
 boundary and Haar, and diffusion.py evaluates all three.
 
 Unrolled descriptor and overlay stay 0. Orientation stays 0.
 mechanics_weight is 0 and the mechanics surrogate is not constructed.
-The descriptor term is the frozen image proxy, weight 0.1, gated by
-descriptor_consistency: low noise, not condition-dropped, and the window's
-own five descriptors present. SSIM is multiplied by 0.
+SSIM and the descriptor are multiplied by 0. The boundary term uses 0.5.
 diffusion.py itself forces mechanics_weight to 0 unless stage is
 diffusion_feedback.
 
@@ -122,9 +122,9 @@ from train_round1 import (
 )
 
 MECHANICS_LOSS_WEIGHT = 0.0
-# SSIM stays off. The descriptor is back at 0.1 by itself.
+# SSIM and the descriptor are off. Boundary is raised on its own.
 # diffusion.py reads config.loss.descriptor; the yaml was not copied.
-LOSS_DESCRIPTOR = 0.1
+LOSS_DESCRIPTOR = 0.0
 LOSS_UNROLLED_DESCRIPTOR = 0.0
 LOSS_OVERLAY = 0.0
 LOSS_ORIENTATION = 0.0
@@ -145,8 +145,8 @@ LOW_NOISE_FRACTION = 0.3
 # Existing spot-check folders. A finished run writes a different directory.
 RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600", "ID03抽查_epoch1152")
 # A new log, so the earlier round-2 csv files on the server stay intact.
-LOSS_LOG_NAME = "train_round2_无ssim_描述符0.1.csv"
-CONFIG_NAME = "第二轮无ssim_描述符0.1配置.json"
+LOSS_LOG_NAME = "train_round2_晶界0.5_无ssim无描述符.csv"
+CONFIG_NAME = "第二轮晶界0.5_无ssim无描述符配置.json"
 WINDOW_DESCRIPTOR_FIELDS = (
     "D50",
     "log_spread",
@@ -196,9 +196,10 @@ if len(WINDOW_DESCRIPTOR_FIELDS) != len(_CANONICAL_DESCRIPTORS):
 # Full four-channel L1. Weight is VaeLossWeights.rgb, not the earlier 4.0 trial.
 LOSS_IMAGE = float(_STRUCTURE_SOURCE.rgb)
 LOSS_EDGE = float(_STRUCTURE_SOURCE.edge)
-LOSS_BOUNDARY = float(_STRUCTURE_SOURCE.boundary)
+# Explicit 0.5. Do not fall back to VaeLossWeights.boundary (0.25).
+LOSS_BOUNDARY = 0.5
 LOSS_HAAR = float(_STRUCTURE_SOURCE.haar)
-# Explicit 0. Do not fall back to VaeLossWeights.ssim (0.25) or the 0.1 trial.
+# Explicit 0. Do not fall back to VaeLossWeights.ssim (0.25).
 LOSS_SSIM = 0.0
 
 
@@ -221,22 +222,23 @@ def structure_loss_weights() -> dict[str, float]:
 
 
 def check_structure_weights(weights: dict[str, float] | None = None) -> dict[str, float]:
-    """Keep SSIM off and the descriptor at 0.1."""
+    """SSIM and descriptor off. Boundary is 0.5, not the dataclass 0.25."""
     weights = structure_loss_weights() if weights is None else weights
     if list(weights) != list(STRUCTURE_TERM_KEYS):
         raise RuntimeError(f"结构损失项不对: {list(weights)}")
     if weights["image"] != float(_STRUCTURE_SOURCE.rgb):
         raise RuntimeError("四通道像素 L1 权重必须是 VaeLossWeights.rgb，也就是 1.0")
-    if weights["ssim"] != 0.0 or weights["descriptor"] != 0.1:
-        raise RuntimeError("SSIM 权重必须是 0，描述符权重必须是 0.1")
+    if weights["ssim"] != 0.0 or weights["descriptor"] != 0.0:
+        raise RuntimeError("SSIM 和描述符权重必须是 0")
+    if weights["boundary"] != 0.5 or weights["boundary"] == float(_STRUCTURE_SOURCE.boundary):
+        raise RuntimeError("晶界权重必须是 0.5，不能沿用 VaeLossWeights.boundary 0.25")
     if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0 or MECHANICS_LOSS_WEIGHT != 0.0:
         raise RuntimeError("展开描述符、叠加、力学必须是 0")
-    if (weights["edge"], weights["boundary"], weights["haar"]) != (
+    if (weights["edge"], weights["haar"]) != (
         float(_STRUCTURE_SOURCE.edge),
-        float(_STRUCTURE_SOURCE.boundary),
         float(_STRUCTURE_SOURCE.haar),
     ):
-        raise RuntimeError("边缘、晶界、Haar 必须保持 VaeLossWeights，不能跟着像素项一起改")
+        raise RuntimeError("边缘和 Haar 必须保持 VaeLossWeights")
     return weights
 
 
@@ -1054,16 +1056,17 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "window_dir": str(args.window_dir),
         "pixel_target": "original 256x256 PNG under 06_可打开的窗口小图, packed by image_to_tensor. The stored clean latent is not decoded as the target. ID03 images are not read.",
         "low_noise_fraction": LOW_NOISE_FRACTION,
-        "structure_timestep_gate": "pixel, edge, boundary, Haar, and descriptor only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step. Descriptor also requires a present window target and no condition drop. SSIM stays in the map at weight 0.",
+        "structure_timestep_gate": "pixel, edge, boundary, and Haar only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step. SSIM and descriptor stay in the map at weight 0. Boundary weight is 0.5.",
         "low_noise_fraction_source": "training/diffusion.py getattr(config.loss, descriptor_low_noise_fraction, 0.3), the gate on overlay and descriptor",
         "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
         "mechanics_surrogate": "not constructed",
         "loss_weights": structure_loss_weights(),
-        "loss_weight_source": "Pixel, edge, boundary, and Haar stay on VaeLossWeights (rgb 1.0, edge 0.5, boundary 0.25, haar 0.25). SSIM is 0. Descriptor is 0.1. SSIM does not use VaeLossWeights.ssim 0.25.",
+        "loss_weight_source": "Pixel, edge, and Haar stay on VaeLossWeights (rgb 1.0, edge 0.5, haar 0.25). Boundary is trained at 0.5, not VaeLossWeights.boundary 0.25. SSIM and descriptor are 0. SSIM does not use VaeLossWeights.ssim 0.25.",
         "loss_log": LOSS_LOG_NAME,
         "loss_formula_source": "013代码/src/ebsd_feedback/training/diffusion.py image L1, edge_loss, boundary_loss, haar_loss",
         "yaml_not_in_tree": "06_配置文件/03_基础条件扩散.yaml was not copied. diffusion.py reads config.loss.image/edge/boundary/haar and does not literalize them.",
         "vae_dataclass_ssim_not_used": float(source.ssim),
+        "vae_dataclass_boundary_not_used": float(source.boundary),
         "vae_terms_not_in_diffusion_total": {
             "flatness": float(source.flatness),
             "kl": float(source.kl),
@@ -1071,6 +1074,7 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         },
         "left_at_zero": {
             "ssim": LOSS_SSIM,
+            "descriptor": LOSS_DESCRIPTOR,
             "unrolled_descriptor": LOSS_UNROLLED_DESCRIPTOR,
             "overlay": LOSS_OVERLAY,
             "orientation": LOSS_ORIENTATION,
