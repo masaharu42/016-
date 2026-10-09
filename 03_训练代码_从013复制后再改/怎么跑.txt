@@ -50,6 +50,6 @@ python "03_训练代码_从013复制后再改/train_round2.py" --checkpoint "04_
 
 描述符代理默认读 07_013各折已有权重/ID03/02b_图像描述符代理/图像描述符_最终模型.pt。服务器上如果没有这份文件，从 013 的 ID03 折把 图像描述符_最终模型.pt 和配套的 VAE_最终模型.pt 一起复制过来。对不上 VAE 的校验就不会开训。
 
-像素 L1 仍是 1.0，边缘 0.5，晶界 0.25，Haar 0.25，噪声 1。SSIM 是 VaeLossWeights.ssim 的 0.25，只对 RGB，和像素、边缘、晶界、Haar 一样只在时间步小于 300 时计算，目标仍是 06_可打开的窗口小图 里的原图。描述符权重 0.25，用冻住的 013 图像描述符代理。目标是 crops.csv 里每个窗口自己的 D50、log_spread、area_weighted_aspect、coarse_area_fraction、boundary_length_density，不是合金共用的 28 维条件。某一列空着或不是数，这个窗口这一步不算描述符。描述符还要求低噪声，并且这一步没有丢掉条件。展开描述符和叠加仍是 0。平坦、KL 不加。
+像素 L1 仍是 1.0，边缘 0.5，晶界 0.25，Haar 0.25，噪声 1。上一轮把 SSIM 和描述符都设成 0.25，从第 1152 轮训到第 2104 轮，晶界变软，黑晶界变弱，颜色块更饱和。这一次两项都改成 0.1。SSIM 不再用 VaeLossWeights.ssim 的 0.25。SSIM 只对 RGB，和像素、边缘、晶界、Haar 一样只在时间步小于 300 时计算，目标仍是 06_可打开的窗口小图 里的原图。描述符权重 0.1，用冻住的 013 图像描述符代理。目标是 crops.csv 里每个窗口自己的 D50、log_spread、area_weighted_aspect、coarse_area_fraction、boundary_length_density，不是合金共用的 28 维条件。某一列空着或不是数，这个窗口这一步不算描述符。描述符还要求低噪声，并且这一步没有丢掉条件。展开描述符和叠加仍是 0。平坦、KL 不加。
 
-每一轮结束都立刻打印 train_total、noise、image、edge、boundary、haar、ssim、descriptor 和 val_noise，并刷新输出。损失写入 04_训练日志/train_round2_ssim描述符.csv。从第 1152 轮开始时这个表从头写。正常结束仍把留出 ID03 的窗口写到新文件夹，打印 id03_sample_dir，不覆盖 ID03抽查、ID03抽查_第二轮、ID03抽查_epoch600、ID03抽查_epoch1152。--smoke 只走一步，不写断点，也不写图。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。
+每一轮结束都立刻打印 train_total、noise、image、edge、boundary、haar、ssim、descriptor 和 val_noise，并刷新输出。损失写入 04_训练日志/train_round2_ssim描述符_权重0.1.csv，不覆盖上一轮 0.25 的 train_round2_ssim描述符.csv。从第 1152 轮开始时这个新表从头写。正常结束仍把留出 ID03 的窗口写到新文件夹，打印 id03_sample_dir，不覆盖 ID03抽查、ID03抽查_第二轮、ID03抽查_epoch600、ID03抽查_epoch1152。--smoke 只走一步，不写断点，也不写图。优化器仍是第一轮的 AdamW：学习率 0.0001，权重衰减 0.0001，betas (0.9, 0.95)，梯度裁剪 1.0。仍从 checkpoint_epoch1152.pt 开始，一批 16 张默认到第 2104 轮。

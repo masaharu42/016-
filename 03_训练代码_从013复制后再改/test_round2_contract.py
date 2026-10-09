@@ -54,13 +54,19 @@ class Round2Contract(unittest.TestCase):
         self.assertEqual(train_round2.LOSS_EDGE, float(source.edge))
         self.assertEqual(train_round2.LOSS_BOUNDARY, float(source.boundary))
         self.assertEqual(train_round2.LOSS_HAAR, float(source.haar))
-        self.assertEqual(train_round2.LOSS_SSIM, float(source.ssim))
-        self.assertEqual(train_round2.LOSS_SSIM, 0.25)
-        self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.25)
+        self.assertEqual(train_round2.LOSS_SSIM, 0.1)
+        self.assertNotEqual(train_round2.LOSS_SSIM, float(source.ssim))
+        self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.1)
         self.assertEqual(list(train_round2.structure_loss_weights()), list(train_round2.STRUCTURE_TERM_KEYS))
         checked = train_round2.check_structure_weights()
-        self.assertEqual(checked["ssim"], 0.25)
-        self.assertEqual(checked["descriptor"], 0.25)
+        self.assertEqual(checked["ssim"], 0.1)
+        self.assertEqual(checked["descriptor"], 0.1)
+        rejected = dict(checked)
+        rejected["ssim"] = 0.25
+        rejected["descriptor"] = 0.25
+        with self.assertRaises(RuntimeError) as still_quarter:
+            train_round2.check_structure_weights(rejected)
+        self.assertIn("0.1", str(still_quarter.exception))
         with self.assertRaises(RuntimeError) as stale:
             train_round2.check_structure_weights({
                 "image": 1.0,
@@ -77,8 +83,8 @@ class Round2Contract(unittest.TestCase):
             "edge": 0.5,
             "boundary": 0.25,
             "haar": 0.25,
-            "ssim": 0.25,
-            "descriptor": 0.25,
+            "ssim": 0.1,
+            "descriptor": 0.1,
         })
         self.assertEqual(train_round2.LOSS_NOISE, 1.0)
         self.assertEqual(train_round2.MECHANICS_LOSS_WEIGHT, 0.0)
@@ -115,8 +121,8 @@ class Round2Contract(unittest.TestCase):
             + 0.5 * parts["edge"]
             + 0.25 * parts["boundary"]
             + 0.25 * parts["haar"]
-            + 0.25 * parts["ssim"]
-            + 0.25 * parts["descriptor"]
+            + 0.1 * parts["ssim"]
+            + 0.1 * parts["descriptor"]
         )
         self.assertTrue(torch.allclose(total, expected))
         self.assertTrue(torch.isfinite(total))
@@ -173,7 +179,7 @@ class Round2Contract(unittest.TestCase):
         self.assertTrue(train_round2.should_rewrite_loss_log(1152, True))
         self.assertFalse(train_round2.should_rewrite_loss_log(1600, True))
         self.assertTrue(train_round2.should_rewrite_loss_log(1600, False))
-        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_ssim描述符.csv")
+        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_ssim描述符_权重0.1.csv")
         self.assertIn("ID03抽查_epoch1152", train_round2.RESERVED_SAMPLE_DIRS)
         train_round2.check_batch_size(16)
         train_round2.check_batch_size(8)
