@@ -21,6 +21,7 @@ sys.path.insert(0, str(PKG))
 
 import train_round1
 import train_round2
+import window_condition
 from ebsd_feedback.losses import VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss
 from ebsd_feedback.models.descriptor_head import DescriptorTargetTransform, LatentDescriptorHead
 from ebsd_feedback.training.descriptor_guidance import descriptor_consistency
@@ -224,12 +225,20 @@ class Round2Contract(unittest.TestCase):
         self.assertTrue(train_round2.should_rewrite_loss_log(1152, True))
         self.assertFalse(train_round2.should_rewrite_loss_log(1600, True))
         self.assertTrue(train_round2.should_rewrite_loss_log(1600, False))
-        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_晶界0.5_晶粒均匀0.1.csv")
+        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_窗口条件_晶界0.5_晶粒均匀0.1.csv")
+        self.assertEqual(train_round2.CONFIG_NAME, "第二轮窗口条件_晶界0.5_晶粒均匀0.1配置.json")
+        self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_晶界0.5_晶粒均匀0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_ssim描述符_权重0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_无ssim无描述符.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_无ssim_描述符0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_晶界0.5_无ssim无描述符.csv")
-        self.assertIn("structure_weights=", inspect.getsource(train_round2.main))
+        main_source = inspect.getsource(train_round2.main)
+        self.assertIn("structure_weights=", main_source)
+        self.assertIn("condition_dim=", main_source)
+        self.assertIn("window_feature_statistics", main_source)
+        self.assertIn("load_expanded_model", main_source)
+        self.assertIn("batch_condition", inspect.getsource(train_round2._optimizer_step))
+        self.assertIn("batch_condition", inspect.getsource(train_round2._val_noise_window))
         self.assertIn("ID03抽查_epoch1152", train_round2.RESERVED_SAMPLE_DIRS)
         train_round2.check_batch_size(16)
         train_round2.check_batch_size(8)
@@ -564,6 +573,129 @@ print(_image_mode())
         self.assertIn("MECHANICS_LOSS_WEIGHT", assigns)
         self.assertIn("LOSS_IMAGE", assigns)
         self.assertNotIn("train_round2", assigns)
+
+    def test_window_condition_appends_position_and_masks_empty_fields(self):
+        self.assertEqual(window_condition.ALLOY_CONDITION_DIM, 28)
+        self.assertEqual(window_condition.CONDITION_DIM, 34)
+        self.assertEqual(train_round2.CONDITION_DIM, 34)
+        self.assertEqual(window_condition.finite_field(None), (0.0, 0.0))
+        self.assertEqual(window_condition.finite_field(""), (0.0, 0.0))
+        self.assertEqual(window_condition.finite_field("  "), (0.0, 0.0))
+        self.assertEqual(window_condition.finite_field("nan"), (0.0, 0.0))
+        self.assertEqual(window_condition.finite_field("inf"), (0.0, 0.0))
+        self.assertEqual(window_condition.finite_field("not-a-number"), (0.0, 0.0))
+        self.assertEqual(window_condition.finite_field("5.5"), (5.5, 1.0))
+        empty = {
+            "latent_x": "64",
+            "latent_y": "48",
+            "D50": "",
+            "log_spread": "nan",
+        }
+        features = window_condition.window_features(empty)
+        self.assertTrue(torch.equal(features, torch.tensor([0.5, 1.0, 0.0, 0.0, 0.0, 0.0])))
+        filled = {"latent_x": "0", "latent_y": "0", "D50": "5.5", "log_spread": "0.2"}
+        alloy = torch.arange(28, dtype=torch.float32)
+        batch = window_condition.batch_condition(
+            [
+                {**empty, "alloy_id": "ID01"},
+                {**filled, "alloy_id": "ID01"},
+            ],
+            {"ID01": alloy},
+        )
+        self.assertEqual(tuple(batch.shape), (2, 34))
+        self.assertTrue(torch.equal(batch[:, :28], alloy.repeat(2, 1)))
+        self.assertEqual(float(batch[1, 30]), 5.5)
+        self.assertEqual(float(batch[1, 31]), 1.0)
+        mean, std = window_condition.window_feature_statistics([
+            empty,
+            filled,
+            {"latent_x": "32", "latent_y": "16", "D50": "6.5", "log_spread": "0.4"},
+            {"latent_x": "16", "latent_y": "0"},
+        ])
+        self.assertEqual(tuple(mean.shape), (6,))
+        self.assertTrue(torch.allclose(mean[2], torch.tensor(6.0)))
+        self.assertGreater(float(std[2]), 0.0)
+        self.assertEqual(float(mean[3]), 0.5)
+        alloy_row = {name: "0.1" for name in train_round1.COND_COLUMNS}
+        alloy_row["alloy_id"] = "ID03"
+        alloy_row["desc_cond_grain_size_median_um"] = "16.5"
+        alloy_row["desc_cond_grain_size_log_spread"] = "0.8"
+        holdout = window_condition.holdout_condition(alloy_row, 4)
+        self.assertEqual(tuple(holdout.shape), (4, 34))
+        self.assertEqual(window_condition.HOLDOUT_SAMPLE_ORIGINS, ((0, 0), (64, 0), (0, 48), (64, 48)))
+        self.assertTrue(torch.allclose(holdout[:, 28:30], torch.tensor([
+            [0.0, 0.0],
+            [0.5, 0.0],
+            [0.0, 1.0],
+            [0.5, 1.0],
+        ])))
+        self.assertTrue(torch.allclose(holdout[:, 30:34], torch.tensor([16.5, 1.0, 0.8, 1.0]).repeat(4, 1)))
+        absent = window_condition.window_features({"latent_x": "0", "latent_y": "0"})
+        self.assertTrue(torch.equal(absent, torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])))
+        sample = (ROOT / "sample_id03.py").read_text(encoding="utf-8")
+        self.assertIn("holdout_condition", sample)
+        self.assertIn("batch_condition", sample)
+        self.assertNotIn("ID03.png", sample)
+
+    def test_expanded_condition_layer_keeps_old_columns_at_zero_init(self):
+        saved = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)
+        target = torch.ones(8, 6)
+        grown = train_round2.expand_saved_tensor(saved, target)
+        self.assertEqual(tuple(grown.shape), (8, 6))
+        self.assertTrue(torch.equal(grown[:, :4], saved))
+        self.assertTrue(torch.equal(grown[:, 4:], torch.zeros(8, 2)))
+        same = train_round2.expand_saved_tensor(saved, saved.clone())
+        self.assertTrue(torch.equal(same, saved))
+        with self.assertRaises(RuntimeError):
+            train_round2.expand_saved_tensor(torch.zeros(8, 7), torch.zeros(8, 6))
+
+        class Tiny(torch.nn.Module):
+            def __init__(self, dim: int) -> None:
+                super().__init__()
+                self.condition_encoder = torch.nn.Module()
+                self.condition_encoder.network = torch.nn.Sequential(
+                    torch.nn.Linear(dim, 8, bias=False)
+                )
+                self.condition_encoder.register_buffer("input_mean", torch.zeros(dim))
+                self.condition_encoder.register_buffer("input_std", torch.ones(dim))
+
+        old = Tiny(4)
+        with torch.no_grad():
+            old.condition_encoder.network[0].weight.copy_(saved)
+            old.condition_encoder.input_mean.copy_(torch.arange(4, dtype=torch.float32))
+        new = Tiny(6)
+        live_mean = torch.arange(6, dtype=torch.float32) + 10
+        live_std = torch.arange(6, dtype=torch.float32) + 3
+        with torch.no_grad():
+            new.condition_encoder.input_mean.copy_(live_mean)
+            new.condition_encoder.input_std.copy_(live_std)
+        train_round2.load_expanded_model(new, old.state_dict())
+        weight = new.condition_encoder.network[0].weight
+        self.assertTrue(torch.equal(weight[:, :4], saved))
+        self.assertTrue(torch.equal(weight[:, 4:], torch.zeros(8, 2)))
+        self.assertTrue(torch.equal(new.condition_encoder.input_mean, live_mean))
+        self.assertTrue(torch.equal(new.condition_encoder.input_std, live_std))
+        probe = torch.randn(2, 4)
+        with torch.no_grad():
+            old_out = old.condition_encoder.network[0](probe)
+            new_out = new.condition_encoder.network[0](torch.cat([probe, torch.randn(2, 2)], dim=1))
+        self.assertTrue(torch.allclose(old_out, new_out))
+
+        narrow = torch.nn.Linear(4, 3, bias=False)
+        opt = torch.optim.AdamW(narrow.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.95))
+        narrow(torch.randn(2, 4)).sum().backward()
+        opt.step()
+        saved_opt = opt.state_dict()
+        wide = torch.nn.Linear(6, 3, bias=False)
+        wide_opt = torch.optim.AdamW(wide.parameters(), lr=1e-4, weight_decay=1e-4, betas=(0.9, 0.95))
+        train_round2.load_expanded_optimizer(wide_opt, saved_opt)
+        moment = wide_opt.state[wide.weight]["exp_avg"]
+        self.assertEqual(tuple(moment.shape), (3, 6))
+        self.assertTrue(torch.equal(moment[:, :4], saved_opt["state"][0]["exp_avg"]))
+        self.assertTrue(torch.equal(moment[:, 4:], torch.zeros(3, 2)))
+        self.assertEqual(tuple(wide_opt.state[wide.weight]["step"].shape), ())
+        wide(torch.randn(2, 6)).sum().backward()
+        wide_opt.step()
 
 
 if __name__ == "__main__":

@@ -18,6 +18,12 @@ on the same low-noise steps as the other image terms. VaeLossWeights.ssim
 stays 0.25 in the dataclass and is not used. Unrolled descriptor and overlay
 stay 0.
 
+The condition is still the 28 alloy numbers, with six window numbers appended:
+normalized latent x and y, window D50, a D50 presence bit, window log_spread,
+and a log_spread presence bit. Empty descriptor cells are 0 with presence 0.
+The first condition layer is widened and the new columns start at 0 so the
+epoch-1152 weights still load. This is not a loss and not a stitching pass.
+
 Image-structure terms are the four that training/diffusion.py adds on top of
 the noise loss when it decodes (not the VAE-only SSIM, flatness, or KL terms):
 
@@ -113,8 +119,6 @@ from train_round1 import (
     LatentStore,
     _import_unet,
     _null,
-    _val_noise,
-    build_model,
     condition_matrix,
     crop_batch,
     epoch_order,
@@ -122,6 +126,12 @@ from train_round1 import (
     noise_loss,
     project_root,
     read_table,
+)
+from window_condition import (
+    CONDITION_DIM,
+    WINDOW_FEATURE_NAMES,
+    batch_condition,
+    window_feature_statistics,
 )
 
 MECHANICS_LOSS_WEIGHT = 0.0
@@ -151,8 +161,8 @@ LOW_NOISE_FRACTION = 0.3
 # Existing spot-check folders. A finished run writes a different directory.
 RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600", "ID03抽查_epoch1152")
 # A new log, so the earlier round-2 csv files on the server stay intact.
-LOSS_LOG_NAME = "train_round2_晶界0.5_晶粒均匀0.1.csv"
-CONFIG_NAME = "第二轮晶界0.5_晶粒均匀0.1配置.json"
+LOSS_LOG_NAME = "train_round2_窗口条件_晶界0.5_晶粒均匀0.1.csv"
+CONFIG_NAME = "第二轮窗口条件_晶界0.5_晶粒均匀0.1配置.json"
 WINDOW_DESCRIPTOR_FIELDS = (
     "D50",
     "log_spread",
@@ -614,6 +624,75 @@ def _check_optimizer(optimizer: torch.optim.Optimizer) -> None:
             raise RuntimeError(f"断点 AdamW betas {betas} 不是 {ADAMW_BETAS}")
 
 
+_STAT_BUFFERS = ("condition_encoder.input_mean", "condition_encoder.input_std")
+_GROW_WEIGHT = "condition_encoder.network.0.weight"
+
+
+def expand_saved_tensor(saved: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """Copy a checkpoint tensor. A wider condition layer keeps the old columns and zeros the rest."""
+    if saved.shape == target.shape:
+        return saved.detach().to(device=target.device, dtype=target.dtype)
+    if saved.ndim != target.ndim or any(old > new for old, new in zip(saved.shape, target.shape)):
+        raise RuntimeError(f"断点张量形状 {tuple(saved.shape)} 不能扩成 {tuple(target.shape)}")
+    grown = target.detach().clone().zero_()
+    slices = tuple(slice(0, size) for size in saved.shape)
+    grown[slices] = saved.detach().to(device=target.device, dtype=target.dtype)
+    return grown
+
+
+def load_expanded_model(model: torch.nn.Module, saved_state: dict[str, torch.Tensor]) -> None:
+    """Load epoch-1152 weights into the wider condition encoder. New input columns stay 0."""
+    current = model.state_dict()
+    extra = [name for name in saved_state if name not in current]
+    missing = [name for name in current if name not in saved_state]
+    if extra or missing:
+        raise RuntimeError(f"断点参数对不上，缺 {missing[:3]} 多 {extra[:3]}")
+    merged = {}
+    for name, target in current.items():
+        old = saved_state[name]
+        if name in _STAT_BUFFERS and old.shape != target.shape:
+            merged[name] = target.detach().clone()
+            continue
+        if old.shape != target.shape and name != _GROW_WEIGHT:
+            raise RuntimeError(f"只有条件层第一层能加宽，{name} 是 {tuple(old.shape)} 对 {tuple(target.shape)}")
+        merged[name] = expand_saved_tensor(old, target)
+    model.load_state_dict(merged)
+
+
+def load_expanded_optimizer(optimizer: torch.optim.Optimizer, saved: dict) -> None:
+    """Keep Adam moments for the old condition columns. New columns start at 0."""
+    current_groups = optimizer.state_dict()["param_groups"]
+    if len(current_groups) != len(saved["param_groups"]):
+        raise RuntimeError("断点优化器参数组数量对不上")
+    shapes = [parameter.shape for group in optimizer.param_groups for parameter in group["params"]]
+    if len(shapes) != len(saved["state"]):
+        raise RuntimeError(f"断点优化器状态 {len(saved['state'])} 项，模型参数 {len(shapes)} 个")
+    state = {}
+    for index, slot in saved["state"].items():
+        copied = {}
+        target_shape = shapes[index]
+        for key, value in slot.items():
+            # Adam's step counter is a scalar. Only the moment tensors match the parameter.
+            if (
+                torch.is_tensor(value)
+                and value.ndim == len(target_shape)
+                and value.shape != target_shape
+            ):
+                copied[key] = expand_saved_tensor(
+                    value,
+                    torch.empty(target_shape, device=value.device, dtype=value.dtype),
+                )
+            else:
+                copied[key] = value
+        state[index] = copied
+    groups = []
+    for saved_group, current_group in zip(saved["param_groups"], current_groups):
+        group = dict(saved_group)
+        group["params"] = current_group["params"]
+        groups.append(group)
+    optimizer.load_state_dict({"state": state, "param_groups": groups})
+
+
 def _restore_ema(ema: ExponentialMovingAverage, saved: dict, device: torch.device) -> None:
     if float(saved["decay"]) != EMA_DECAY:
         raise RuntimeError(f"断点 EMA decay {saved['decay']} 不是 {EMA_DECAY}")
@@ -622,7 +701,10 @@ def _restore_ema(ema: ExponentialMovingAverage, saved: dict, device: torch.devic
     if missing or extra:
         raise RuntimeError(f"EMA 参数对不上，缺 {missing[:3]} 多 {extra[:3]}")
     for name, value in saved["shadow"].items():
-        ema.shadow[name].copy_(value.to(device=device, dtype=ema.shadow[name].dtype))
+        target = ema.shadow[name]
+        if name in _STAT_BUFFERS and tuple(value.shape) != tuple(target.shape):
+            continue
+        ema.shadow[name].copy_(expand_saved_tensor(value.to(device), target))
 
 
 def save_checkpoint(path: Path, model, ema, optimizer, epoch: int, step: int, values: torch.Tensor, resumed_from: str, resumed_from_epoch: int) -> None:
@@ -636,6 +718,8 @@ def save_checkpoint(path: Path, model, ema, optimizer, epoch: int, step: int, va
             "step": step,
             "condition_mean": values.mean(0),
             "condition_std": values.std(0),
+            "condition_dim": int(model.condition_encoder.input_mean.numel()),
+            "window_feature_names": list(WINDOW_FEATURE_NAMES),
             "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
             "latent_scale": LATENT_SCALE,
             "learning_rate": LEARNING_RATE,
@@ -825,6 +909,10 @@ def main() -> None:
         args.epochs = default_extra_epochs(args.batch_size)
     weights = check_structure_weights()
     print(f"structure_weights={weights}", flush=True)
+    print(
+        f"condition_dim={CONDITION_DIM} window_features={list(WINDOW_FEATURE_NAMES)}",
+        flush=True,
+    )
     if not args.window_dir.is_dir():
         raise FileNotFoundError(f"缺少训练窗口原图目录 {args.window_dir}")
     ConditionalLatentUNet, DiffusionSchedule, cosine_beta_schedule = _import_unet()
@@ -878,8 +966,21 @@ def main() -> None:
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.benchmark = True
-    model = build_model(ConditionalLatentUNet, cond_values, device)
-    model.load_state_dict(state["model"])
+    window_mean, window_std = window_feature_statistics(crops)
+    alloy_mean = cond_values.mean(0)
+    alloy_std = cond_values.std(0).clamp_min(1e-6)
+    model = ConditionalLatentUNet(
+        latent_channels=4,
+        condition_dim=CONDITION_DIM,
+        base_channels=128,
+        channel_multipliers=(1, 2, 3, 4),
+        attention_heads=8,
+    ).to(device)
+    model.condition_encoder.set_statistics(
+        torch.cat([alloy_mean, window_mean]).to(device),
+        torch.cat([alloy_std, window_std]).to(device),
+    )
+    load_expanded_model(model, state["model"])
     schedule = DiffusionSchedule(int(state.get("training_timesteps", TRAINING_TIMESTEPS))).to(device)
     ema = ExponentialMovingAverage(model, EMA_DECAY)
     _restore_ema(ema, state["ema"], device)
@@ -890,7 +991,7 @@ def main() -> None:
         betas=ADAMW_BETAS,
         fused=device.type == "cuda",
     )
-    optimizer.load_state_dict(state["optimizer"])
+    load_expanded_optimizer(optimizer, state["optimizer"])
     _check_optimizer(optimizer)
     step = int(state["step"])
     if args.smoke:
@@ -940,7 +1041,7 @@ def main() -> None:
             )
             is_last = start + args.batch_size >= len(order)
             if is_last:
-                val_noise = f"{_val_noise(model, schedule, store, val_rows, cond_map, device, args.batch_size):.8f}"
+                val_noise = f"{_val_noise_window(model, schedule, store, val_rows, cond_map, device, args.batch_size):.8f}"
                 model.train()
             row["epoch"] = epoch
             row["val_noise"] = val_noise
@@ -968,7 +1069,7 @@ def _optimizer_step(
     descriptor_head, descriptor_transform, device, precision, step,
 ):
     latent = crop_batch(store, batch_rows).to(device, non_blocking=True)
-    condition = torch.stack([cond_map[row["alloy_id"]] for row in batch_rows], 0).to(device, non_blocking=True)
+    condition = batch_condition(batch_rows, cond_map).to(device, non_blocking=True)
     target = load_original_batch(window_dir, batch_rows).to(device, non_blocking=True)
     descriptor_values, descriptor_present = window_descriptor_batch(batch_rows)
     noise = torch.randn_like(latent)
@@ -1018,6 +1119,30 @@ def _optimizer_step(
         "val_noise": "",
     }
     return step, row
+
+
+@torch.no_grad()
+def _val_noise_window(model, schedule, store, rows, cond_map, device, batch_size) -> float:
+    """Same noise check as round 1, with the window features appended."""
+    model.eval()
+    total = 0.0
+    count = 0
+    for start in range(0, len(rows), batch_size):
+        batch_rows = rows[start:start + batch_size]
+        latent = crop_batch(store, batch_rows).to(device, non_blocking=True)
+        condition = batch_condition(batch_rows, cond_map).to(device, non_blocking=True)
+        noise = torch.randn_like(latent)
+        timesteps = torch.randint(0, schedule.timesteps, (latent.shape[0],), device=device)
+        noisy = schedule.add_noise(latent, noise, timesteps)
+        predicted = model(noisy, timesteps, condition, None)
+        per_sample = (predicted.float() - noise.float()).square().flatten(1).mean(1)
+        weighted = per_sample * schedule.min_snr_weight(timesteps, MIN_SNR_GAMMA)
+        total += float(weighted.sum())
+        count += int(weighted.shape[0])
+    if count == 0:
+        raise RuntimeError("验证条是空的")
+    model.train()
+    return total / count
 
 
 def write_heldout_samples(checkpoint: Path, vae_path: Path, out_dir: Path, seed: int) -> Path:
@@ -1106,6 +1231,9 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "low_noise_fraction": LOW_NOISE_FRACTION,
         "structure_timestep_gate": "pixel, edge, boundary, Haar, and grain coherence only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step. SSIM and descriptor stay in the map at weight 0. Boundary weight is 0.5. Grain coherence is local RGB variance inside the target grain interior, weight 0.1.",
         "low_noise_fraction_source": "training/diffusion.py getattr(config.loss, descriptor_low_noise_fraction, 0.3), the gate on overlay and descriptor",
+        "condition_dim": CONDITION_DIM,
+        "window_feature_names": list(WINDOW_FEATURE_NAMES),
+        "window_condition": "Appended to the 28 alloy numbers: latent_x/128, latent_y/48, window D50, D50 present, window log_spread, log_spread present. Empty cells are 0 with present 0. Not a loss.",
         "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
         "mechanics_surrogate": "not constructed",
         "loss_weights": structure_loss_weights(),

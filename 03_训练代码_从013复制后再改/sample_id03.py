@@ -28,6 +28,7 @@ from train_round1 import (
     project_root,
     read_table,
 )
+from window_condition import CONDITION_DIM, HOLDOUT_SAMPLE_ORIGINS, batch_condition, holdout_condition
 
 CORR_NEAR_ONE = 0.98
 GUIDANCE_SCALE = 2.0
@@ -47,9 +48,13 @@ def _import_models():
 def load_unet(checkpoint: Path, device: torch.device):
     ConditionalLatentUNet, DiffusionSchedule, _ = _import_models()
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
+    weight = state["model"]["condition_encoder.network.0.weight"]
+    condition_dim = int(weight.shape[1])
+    if condition_dim not in (len(COND_COLUMNS), CONDITION_DIM):
+        raise RuntimeError(f"断点条件维度 {condition_dim} 不是 {len(COND_COLUMNS)} 也不是 {CONDITION_DIM}")
     model = ConditionalLatentUNet(
         latent_channels=4,
-        condition_dim=len(COND_COLUMNS),
+        condition_dim=condition_dim,
         base_channels=128,
         channel_multipliers=(1, 2, 3, 4),
         attention_heads=8,
@@ -57,10 +62,14 @@ def load_unet(checkpoint: Path, device: torch.device):
     model.load_state_dict(state["model"])
     copied = model.state_dict()
     for name, value in state["ema"]["shadow"].items():
+        if tuple(value.shape) != tuple(copied[name].shape):
+            raise RuntimeError(f"EMA {name} 形状 {tuple(value.shape)} 对不上 {tuple(copied[name].shape)}")
         copied[name].copy_(value)
-    mean = state["condition_mean"].to(device=device, dtype=torch.float32)
-    std = state["condition_std"].to(device=device, dtype=torch.float32)
-    model.condition_encoder.set_statistics(mean, std.clamp_min(1e-6))
+    model.load_state_dict(copied)
+    if condition_dim == len(COND_COLUMNS):
+        mean = state["condition_mean"].to(device=device, dtype=torch.float32)
+        std = state["condition_std"].to(device=device, dtype=torch.float32)
+        model.condition_encoder.set_statistics(mean, std.clamp_min(1e-6))
     schedule = DiffusionSchedule(int(state.get("training_timesteps", TRAINING_TIMESTEPS))).to(device)
     return model, schedule, state
 
@@ -102,9 +111,18 @@ def sample_id03(args, device) -> None:
     rows = [row for row in table if row["alloy_id"] == HOLDOUT]
     if len(rows) != 1:
         raise RuntimeError("需要 conditions_ID03_holdout.csv 里的那一行 ID03，不要用训练表")
-    condition = torch.tensor(
-        [float(rows[0][name]) for name in COND_COLUMNS], dtype=torch.float32, device=device
-    ).repeat(args.count, 1)
+    alloy = torch.tensor(
+        [float(rows[0][name]) for name in COND_COLUMNS], dtype=torch.float32
+    )
+    if int(model.condition_encoder.input_mean.numel()) == CONDITION_DIM:
+        condition = holdout_condition(rows[0], args.count).to(device)
+        print(
+            f"id03_window_origins={list(HOLDOUT_SAMPLE_ORIGINS[:args.count])} "
+            f"window_d50=desc_cond_grain_size_median_um condition_dim={CONDITION_DIM}",
+            flush=True,
+        )
+    else:
+        condition = alloy.repeat(args.count, 1).to(device)
     generator = torch.Generator(device=device).manual_seed(args.seed)
     latent = schedule.ddim_sample(
         model,
@@ -125,7 +143,12 @@ def sample_id03(args, device) -> None:
         "seed": args.seed,
         "steps": args.steps,
         "guidance": args.guidance,
-        "note": "只用于最后看 ID03。不参与做清单，也不拿来调参。没有读取 ID03 的原图。",
+        "condition_dim": int(condition.shape[1]),
+        "window_origins": [
+            {"latent_x": origin_x, "latent_y": origin_y}
+            for origin_x, origin_y in list(HOLDOUT_SAMPLE_ORIGINS)[:args.count]
+        ] if int(condition.shape[1]) == CONDITION_DIM else [],
+        "note": "只用于最后看 ID03。不参与做清单，也不拿来调参。没有读取 ID03 的原图。34 维条件时窗口位置是训练区四个角，D50 和 log_spread 用留出合金条件里的描述符，不是窗口实测。",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"wrote {args.count} windows to {args.out_dir}", flush=True)
 
@@ -147,8 +170,11 @@ def memorization_check(args, device) -> None:
     vae = load_vae(args.vae, device)
     rng = np.random.default_rng(args.seed)
     pick = rng.choice(len(crops), size=args.count, replace=False)
-    alloys = [crops[int(i)]["alloy_id"] for i in pick]
-    condition = torch.stack([cond_map[alloy] for alloy in alloys], 0).to(device)
+    picked = [crops[int(i)] for i in pick]
+    if int(model.condition_encoder.input_mean.numel()) == CONDITION_DIM:
+        condition = batch_condition(picked, cond_map).to(device)
+    else:
+        condition = torch.stack([cond_map[row["alloy_id"]] for row in picked], 0).to(device)
     generator = torch.Generator(device=device).manual_seed(args.seed)
     latent = schedule.ddim_sample(
         model,
