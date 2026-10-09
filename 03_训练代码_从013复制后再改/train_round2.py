@@ -200,8 +200,12 @@ LOSS_HAAR = float(_STRUCTURE_SOURCE.haar)
 LOSS_SSIM = float(_STRUCTURE_SOURCE.ssim)
 
 
+# Order is the startup check. SSIM and descriptor stay in the trained loss.
+STRUCTURE_TERM_KEYS = ("image", "edge", "boundary", "haar", "ssim", "descriptor")
+
+
 def structure_loss_weights() -> dict[str, float]:
-    return {
+    weights = {
         "image": LOSS_IMAGE,
         "edge": LOSS_EDGE,
         "boundary": LOSS_BOUNDARY,
@@ -209,6 +213,29 @@ def structure_loss_weights() -> dict[str, float]:
         "ssim": LOSS_SSIM,
         "descriptor": LOSS_DESCRIPTOR,
     }
+    if tuple(weights) != STRUCTURE_TERM_KEYS:
+        raise RuntimeError(f"结构损失项不对: {list(weights)}")
+    return weights
+
+
+def check_structure_weights(weights: dict[str, float] | None = None) -> dict[str, float]:
+    """Reject a weight map that drops SSIM or the descriptor term."""
+    weights = structure_loss_weights() if weights is None else weights
+    if list(weights) != list(STRUCTURE_TERM_KEYS):
+        raise RuntimeError(f"结构损失项不对: {list(weights)}")
+    if weights["image"] != float(_STRUCTURE_SOURCE.rgb):
+        raise RuntimeError("四通道像素 L1 权重必须是 VaeLossWeights.rgb，也就是 1.0")
+    if weights["ssim"] != float(_STRUCTURE_SOURCE.ssim) or weights["descriptor"] != 0.25:
+        raise RuntimeError("SSIM 和描述符权重必须是 0.25")
+    if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0 or MECHANICS_LOSS_WEIGHT != 0.0:
+        raise RuntimeError("展开描述符、叠加、力学必须是 0")
+    if (weights["edge"], weights["boundary"], weights["haar"]) != (
+        float(_STRUCTURE_SOURCE.edge),
+        float(_STRUCTURE_SOURCE.boundary),
+        float(_STRUCTURE_SOURCE.haar),
+    ):
+        raise RuntimeError("边缘、晶界、Haar 必须保持 VaeLossWeights，不能跟着像素项一起改")
+    return weights
 
 
 def image_structure_losses(decoded: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -414,8 +441,7 @@ def diffusion_structure_total(
         raise RuntimeError("第二轮 MECHANICS_LOSS_WEIGHT 必须是 0，不跑力学代理。")
     if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0 or LOSS_ORIENTATION != 0.0:
         raise RuntimeError("展开描述符、叠加、取向这一轮权重必须是 0。")
-    expected = {"image", "edge", "boundary", "haar", "ssim", "descriptor"}
-    if set(parts) != expected:
+    if set(parts) != set(STRUCTURE_TERM_KEYS):
         raise RuntimeError(f"结构损失项不对，实际 {sorted(parts)}")
     return (
         LOSS_NOISE * loss_noise
@@ -681,23 +707,9 @@ def main() -> None:
     check_batch_size(args.batch_size)
     if args.epochs is None:
         args.epochs = default_extra_epochs(args.batch_size)
-    weights = structure_loss_weights()
-    if list(weights) != ["image", "edge", "boundary", "haar"]:
-        raise RuntimeError(f"结构损失项不对: {list(weights)}")
-    if weights["image"] != float(_STRUCTURE_SOURCE.rgb):
-        raise RuntimeError("四通道像素 L1 权重必须是 VaeLossWeights.rgb，也就是 1.0")
-    if weights["ssim"] != float(_STRUCTURE_SOURCE.ssim) or weights["descriptor"] != 0.25:
-        raise RuntimeError("SSIM 和描述符权重必须是 0.25")
-    if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0:
-        raise RuntimeError("展开描述符和叠加必须是 0")
+    weights = check_structure_weights()
     if not args.window_dir.is_dir():
         raise FileNotFoundError(f"缺少训练窗口原图目录 {args.window_dir}")
-    if (weights["edge"], weights["boundary"], weights["haar"]) != (
-        float(_STRUCTURE_SOURCE.edge),
-        float(_STRUCTURE_SOURCE.boundary),
-        float(_STRUCTURE_SOURCE.haar),
-    ):
-        raise RuntimeError("边缘、晶界、Haar 必须保持 VaeLossWeights，不能跟着像素项一起改")
     ConditionalLatentUNet, DiffusionSchedule, cosine_beta_schedule = _import_unet()
     probe = cosine_beta_schedule(TRAINING_TIMESTEPS, offset=COSINE_BETA_OFFSET)
     if probe.shape != (TRAINING_TIMESTEPS,):

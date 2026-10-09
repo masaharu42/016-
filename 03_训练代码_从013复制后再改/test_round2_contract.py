@@ -57,6 +57,21 @@ class Round2Contract(unittest.TestCase):
         self.assertEqual(train_round2.LOSS_SSIM, float(source.ssim))
         self.assertEqual(train_round2.LOSS_SSIM, 0.25)
         self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.25)
+        self.assertEqual(list(train_round2.structure_loss_weights()), list(train_round2.STRUCTURE_TERM_KEYS))
+        checked = train_round2.check_structure_weights()
+        self.assertEqual(checked["ssim"], 0.25)
+        self.assertEqual(checked["descriptor"], 0.25)
+        with self.assertRaises(RuntimeError) as stale:
+            train_round2.check_structure_weights({
+                "image": 1.0,
+                "edge": 0.5,
+                "boundary": 0.25,
+                "haar": 0.25,
+            })
+        self.assertIn("结构损失项不对", str(stale.exception))
+        main_source = inspect.getsource(train_round2.main)
+        self.assertIn("check_structure_weights()", main_source)
+        self.assertNotIn('["image", "edge", "boundary", "haar"]', main_source)
         self.assertEqual(train_round2.structure_loss_weights(), {
             "image": 1.0,
             "edge": 0.5,
