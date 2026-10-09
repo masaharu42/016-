@@ -11,10 +11,12 @@ epoch, so the default is 952 more epochs (19992 steps): 1152 through 2104.
 Batch 8 draws 42 steps per epoch, so the default is 476 more epochs and ends
 at epoch 1628. Every epoch prints the total, each term, and one GPU utilization sample, flushed.
 
-SSIM and the descriptor stay in the six-term map at weight 0. The boundary
-weight is 0.5, not VaeLossWeights.boundary 0.25. Image stays 1.0, edge 0.5,
-Haar 0.25. VaeLossWeights.ssim stays 0.25 in the dataclass and is not used.
-Unrolled descriptor and overlay stay 0.
+SSIM and the descriptor stay in the map at weight 0. The boundary weight is
+0.5, not VaeLossWeights.boundary 0.25. Image stays 1.0, edge 0.5, Haar 0.25.
+Grain coherence is 0.1: local RGB variance inside the target grain interiors,
+on the same low-noise steps as the other image terms. VaeLossWeights.ssim
+stays 0.25 in the dataclass and is not used. Unrolled descriptor and overlay
+stay 0.
 
 Image-structure terms are the four that training/diffusion.py adds on top of
 the noise loss when it decodes (not the VAE-only SSIM, flatness, or KL terms):
@@ -53,6 +55,7 @@ boundary and Haar, and diffusion.py evaluates all three.
 Unrolled descriptor and overlay stay 0. Orientation stays 0.
 mechanics_weight is 0 and the mechanics surrogate is not constructed.
 SSIM and the descriptor are multiplied by 0. The boundary term uses 0.5.
+Grain coherence multiplies local interior RGB variance by 0.1.
 diffusion.py itself forces mechanics_weight to 0 unless stage is
 diffusion_feedback.
 
@@ -122,9 +125,12 @@ from train_round1 import (
 )
 
 MECHANICS_LOSS_WEIGHT = 0.0
-# SSIM and the descriptor are off. Boundary is raised on its own.
+# SSIM and the descriptor stay off. Boundary stays at 0.5.
 # diffusion.py reads config.loss.descriptor; the yaml was not copied.
 LOSS_DESCRIPTOR = 0.0
+# Local RGB variance inside target grain interiors. Not the VAE flatness term.
+LOSS_GRAIN_COHERENCE = 0.1
+GRAIN_COHERENCE_WINDOW = 9
 LOSS_UNROLLED_DESCRIPTOR = 0.0
 LOSS_OVERLAY = 0.0
 LOSS_ORIENTATION = 0.0
@@ -145,8 +151,8 @@ LOW_NOISE_FRACTION = 0.3
 # Existing spot-check folders. A finished run writes a different directory.
 RESERVED_SAMPLE_DIRS = ("ID03抽查", "ID03抽查_第二轮", "ID03抽查_epoch600", "ID03抽查_epoch1152")
 # A new log, so the earlier round-2 csv files on the server stay intact.
-LOSS_LOG_NAME = "train_round2_晶界0.5_无ssim无描述符.csv"
-CONFIG_NAME = "第二轮晶界0.5_无ssim无描述符配置.json"
+LOSS_LOG_NAME = "train_round2_晶界0.5_晶粒均匀0.1.csv"
+CONFIG_NAME = "第二轮晶界0.5_晶粒均匀0.1配置.json"
 WINDOW_DESCRIPTOR_FIELDS = (
     "D50",
     "log_spread",
@@ -167,19 +173,21 @@ def _import_structure():
         sys.path.insert(0, str(pkg))
     from ebsd_feedback.constants import DESCRIPTOR_COLUMNS
     from ebsd_feedback.data import image_to_tensor
-    from ebsd_feedback.losses import VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss
+    from ebsd_feedback.losses import (
+        VaeLossWeights, boundary_loss, edge_loss, haar_loss, soft_boundary_map, ssim_loss,
+    )
     from ebsd_feedback.models.vae import BoundaryAwareVAE
     from ebsd_feedback.training.descriptor_guidance import descriptor_consistency
     from ebsd_feedback.training.image_descriptor import load_frozen_proxy
     return (
-        VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss, BoundaryAwareVAE,
-        image_to_tensor, DESCRIPTOR_COLUMNS, descriptor_consistency, load_frozen_proxy,
+        VaeLossWeights, boundary_loss, edge_loss, haar_loss, soft_boundary_map, ssim_loss,
+        BoundaryAwareVAE, image_to_tensor, DESCRIPTOR_COLUMNS, descriptor_consistency, load_frozen_proxy,
     )
 
 
 (
-    VaeLossWeights, boundary_loss, edge_loss, haar_loss, ssim_loss, BoundaryAwareVAE,
-    image_to_tensor, DESCRIPTOR_COLUMNS, descriptor_consistency, load_frozen_proxy,
+    VaeLossWeights, boundary_loss, edge_loss, haar_loss, soft_boundary_map, ssim_loss,
+    BoundaryAwareVAE, image_to_tensor, DESCRIPTOR_COLUMNS, descriptor_consistency, load_frozen_proxy,
 ) = _import_structure()
 _STRUCTURE_SOURCE = VaeLossWeights()
 _CANONICAL_DESCRIPTORS = (
@@ -203,8 +211,11 @@ LOSS_HAAR = float(_STRUCTURE_SOURCE.haar)
 LOSS_SSIM = 0.0
 
 
-# Order is the startup check. SSIM and descriptor stay in the trained loss.
-STRUCTURE_TERM_KEYS = ("image", "edge", "boundary", "haar", "ssim", "descriptor")
+# Order is the startup check. SSIM and descriptor stay in the map at 0.
+STRUCTURE_TERM_KEYS = (
+    "image", "edge", "boundary", "haar", "ssim", "descriptor", "grain_coherence",
+)
+IMAGE_TERM_KEYS = ("image", "edge", "boundary", "haar", "ssim", "grain_coherence")
 
 
 def structure_loss_weights() -> dict[str, float]:
@@ -215,6 +226,7 @@ def structure_loss_weights() -> dict[str, float]:
         "haar": LOSS_HAAR,
         "ssim": LOSS_SSIM,
         "descriptor": LOSS_DESCRIPTOR,
+        "grain_coherence": LOSS_GRAIN_COHERENCE,
     }
     if tuple(weights) != STRUCTURE_TERM_KEYS:
         raise RuntimeError(f"结构损失项不对: {list(weights)}")
@@ -232,6 +244,8 @@ def check_structure_weights(weights: dict[str, float] | None = None) -> dict[str
         raise RuntimeError("SSIM 和描述符权重必须是 0")
     if weights["boundary"] != 0.5 or weights["boundary"] == float(_STRUCTURE_SOURCE.boundary):
         raise RuntimeError("晶界权重必须是 0.5，不能沿用 VaeLossWeights.boundary 0.25")
+    if weights["grain_coherence"] != 0.1:
+        raise RuntimeError("晶粒均匀权重必须是 0.1")
     if LOSS_UNROLLED_DESCRIPTOR != 0.0 or LOSS_OVERLAY != 0.0 or MECHANICS_LOSS_WEIGHT != 0.0:
         raise RuntimeError("展开描述符、叠加、力学必须是 0")
     if (weights["edge"], weights["haar"]) != (
@@ -242,14 +256,41 @@ def check_structure_weights(weights: dict[str, float] | None = None) -> dict[str
     return weights
 
 
+def grain_coherence_loss(
+    prediction: torch.Tensor,
+    target: torch.Tensor,
+    window: int = GRAIN_COHERENCE_WINDOW,
+) -> torch.Tensor:
+    """Local RGB variance inside the target's grain interiors.
+
+    The fourth channel is high on grain interiors and low on black boundaries.
+    The interior mask comes from the target and is detached, so the penalty
+    does not reward painting boundaries over noisy color. Boundary pixels do
+    not enter the local mean.
+    """
+    rgb = prediction[:, :3].float()
+    interior = (1.0 - soft_boundary_map(target.float()).detach()).clamp(0.0, 1.0)
+    padding = window // 2
+    coverage = F.avg_pool2d(interior, window, stride=1, padding=padding).clamp_min(1e-6)
+    variance = []
+    for channel in range(rgb.shape[1]):
+        values = rgb[:, channel:channel + 1]
+        local_mean = F.avg_pool2d(values * interior, window, stride=1, padding=padding) / coverage
+        local_second = F.avg_pool2d(values.square() * interior, window, stride=1, padding=padding) / coverage
+        variance.append((local_second - local_mean.square()).clamp_min(0.0))
+    local_variance = torch.cat(variance, dim=1).mean(dim=1, keepdim=True)
+    return (local_variance * interior).sum() / interior.sum().clamp_min(1.0)
+
+
 def image_structure_losses(decoded: torch.Tensor, target: torch.Tensor) -> dict[str, torch.Tensor]:
-    """Pixel, edge, boundary, Haar, and RGB SSIM. target is the original window."""
+    """Pixel, edge, boundary, Haar, RGB SSIM, and grain coherence. target is the original window."""
     return {
         "image": F.l1_loss(decoded, target),
         "edge": edge_loss(decoded, target),
         "boundary": boundary_loss(decoded, target),
         "haar": haar_loss(decoded, target),
         "ssim": ssim_loss(decoded[:, :3], target[:, :3]),
+        "grain_coherence": grain_coherence_loss(decoded, target),
     }
 
 
@@ -280,7 +321,7 @@ def structure_losses_for_timesteps(
     active = low_noise_mask(timesteps, total_timesteps, LOW_NOISE_FRACTION)
     if not bool(active.any()):
         zero = decoded.sum() * 0.0
-        return {name: zero for name in ("image", "edge", "boundary", "haar", "ssim")}
+        return {name: zero for name in IMAGE_TERM_KEYS}
     return image_structure_losses(decoded[active], target[active])
 
 
@@ -455,6 +496,7 @@ def diffusion_structure_total(
         + LOSS_HAAR * parts["haar"]
         + LOSS_SSIM * parts["ssim"]
         + LOSS_DESCRIPTOR * parts["descriptor"]
+        + LOSS_GRAIN_COHERENCE * parts["grain_coherence"]
     )
 
 
@@ -614,6 +656,7 @@ def save_checkpoint(path: Path, model, ema, optimizer, epoch: int, step: int, va
             "loss_haar_weight": LOSS_HAAR,
             "loss_ssim_weight": LOSS_SSIM,
             "loss_descriptor_weight": LOSS_DESCRIPTOR,
+            "loss_grain_coherence_weight": LOSS_GRAIN_COHERENCE,
             "loss_unrolled_descriptor_weight": LOSS_UNROLLED_DESCRIPTOR,
             "loss_overlay_weight": LOSS_OVERLAY,
             "low_noise_fraction": LOW_NOISE_FRACTION,
@@ -767,7 +810,8 @@ def format_epoch_line(epoch: int, rows: list[dict[str, str]], val_noise: str) ->
         f"noise {mean('loss_noise'):.4f} image {mean('loss_image'):.4f} "
         f"edge {mean('loss_edge'):.4f} boundary {mean('loss_boundary'):.4f} "
         f"haar {mean('loss_haar'):.4f} ssim {mean('loss_ssim'):.4f} "
-        f"descriptor {mean('loss_descriptor'):.4f} val_noise {val_noise}"
+        f"descriptor {mean('loss_descriptor'):.4f} "
+        f"grain_coherence {mean('loss_grain_coherence'):.4f} val_noise {val_noise}"
     )
 
 
@@ -823,6 +867,7 @@ def main() -> None:
         f"lr={LEARNING_RATE} betas={ADAMW_BETAS} "
         f"loss_image={LOSS_IMAGE} loss_edge={LOSS_EDGE} loss_boundary={LOSS_BOUNDARY} loss_haar={LOSS_HAAR} "
         f"loss_ssim={LOSS_SSIM} loss_descriptor={LOSS_DESCRIPTOR} "
+        f"loss_grain_coherence={LOSS_GRAIN_COHERENCE} "
         f"low_noise_fraction={LOW_NOISE_FRACTION} window_dir={args.window_dir} "
         f"mechanics_weight={MECHANICS_LOSS_WEIGHT}",
         flush=True,
@@ -873,7 +918,8 @@ def main() -> None:
     log_path = args.log_dir / LOSS_LOG_NAME
     fields = [
         "epoch", "step", "loss_total", "loss_noise", "loss_image", "loss_edge",
-        "loss_boundary", "loss_haar", "loss_ssim", "loss_descriptor", "loss_mechanics", "val_noise",
+        "loss_boundary", "loss_haar", "loss_ssim", "loss_descriptor", "loss_grain_coherence",
+        "loss_mechanics", "val_noise",
     ]
     if should_rewrite_loss_log(start_epoch, log_path.is_file()):
         with log_path.open("w", newline="", encoding="utf-8") as handle:
@@ -947,7 +993,7 @@ def _optimizer_step(
             )
         else:
             zero = predicted_clean.sum() * 0.0
-            parts = {name: zero for name in ("image", "edge", "boundary", "haar", "ssim", "descriptor")}
+            parts = {name: zero for name in STRUCTURE_TERM_KEYS}
     total = diffusion_structure_total(loss_noise, parts)
     if not bool(torch.isfinite(total)):
         raise RuntimeError("第二轮损失出现 NaN/Inf")
@@ -967,6 +1013,7 @@ def _optimizer_step(
         "loss_haar": f"{float(parts['haar'].detach()):.8f}",
         "loss_ssim": f"{float(parts['ssim'].detach()):.8f}",
         "loss_descriptor": f"{float(parts['descriptor'].detach()):.8f}",
+        "loss_grain_coherence": f"{float(parts['grain_coherence'].detach()):.8f}",
         "loss_mechanics": "0.0",
         "val_noise": "",
     }
@@ -1012,6 +1059,7 @@ def _smoke_step(
         f"loss_image={row['loss_image']} loss_edge={row['loss_edge']} "
         f"loss_boundary={row['loss_boundary']} loss_haar={row['loss_haar']} "
         f"loss_ssim={row['loss_ssim']} loss_descriptor={row['loss_descriptor']} "
+        f"loss_grain_coherence={row['loss_grain_coherence']} "
         f"loss_mechanics={row['loss_mechanics']} window={batch_rows[0]['alloy_id']}_{batch_rows[0]['view']}",
         flush=True,
     )
@@ -1056,12 +1104,12 @@ def _config_record(args, precision: str, steps_per_epoch: int, start_epoch: int,
         "window_dir": str(args.window_dir),
         "pixel_target": "original 256x256 PNG under 06_可打开的窗口小图, packed by image_to_tensor. The stored clean latent is not decoded as the target. ID03 images are not read.",
         "low_noise_fraction": LOW_NOISE_FRACTION,
-        "structure_timestep_gate": "pixel, edge, boundary, and Haar only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step. SSIM and descriptor stay in the map at weight 0. Boundary weight is 0.5.",
+        "structure_timestep_gate": "pixel, edge, boundary, Haar, and grain coherence only when timesteps < int(training_timesteps * low_noise_fraction). Noise loss is every step. SSIM and descriptor stay in the map at weight 0. Boundary weight is 0.5. Grain coherence is local RGB variance inside the target grain interior, weight 0.1.",
         "low_noise_fraction_source": "training/diffusion.py getattr(config.loss, descriptor_low_noise_fraction, 0.3), the gate on overlay and descriptor",
         "mechanics_loss_weight": MECHANICS_LOSS_WEIGHT,
         "mechanics_surrogate": "not constructed",
         "loss_weights": structure_loss_weights(),
-        "loss_weight_source": "Pixel, edge, and Haar stay on VaeLossWeights (rgb 1.0, edge 0.5, haar 0.25). Boundary is trained at 0.5, not VaeLossWeights.boundary 0.25. SSIM and descriptor are 0. SSIM does not use VaeLossWeights.ssim 0.25.",
+        "loss_weight_source": "Pixel, edge, and Haar stay on VaeLossWeights (rgb 1.0, edge 0.5, haar 0.25). Boundary is trained at 0.5, not VaeLossWeights.boundary 0.25. SSIM and descriptor are 0. Grain coherence is 0.1. SSIM does not use VaeLossWeights.ssim 0.25.",
         "loss_log": LOSS_LOG_NAME,
         "loss_formula_source": "013代码/src/ebsd_feedback/training/diffusion.py image L1, edge_loss, boundary_loss, haar_loss",
         "yaml_not_in_tree": "06_配置文件/03_基础条件扩散.yaml was not copied. diffusion.py reads config.loss.image/edge/boundary/haar and does not literalize them.",

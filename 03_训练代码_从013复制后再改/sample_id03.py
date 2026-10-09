@@ -203,7 +203,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--out-dir", type=Path, default=root / "04_训练日志" / "ID03抽查")
     parser.add_argument("--count", type=int, default=4)
     parser.add_argument("--steps", type=int, default=SAMPLING_STEPS)
-    parser.add_argument("--guidance", type=float, default=GUIDANCE_SCALE)
+    parser.add_argument(
+        "--guidance",
+        type=float,
+        default=GUIDANCE_SCALE,
+        help="DDIM classifier-free guidance. Default 2.0. Comparison settings are 1.5, 2.5, and 3.0.",
+    )
     parser.add_argument("--decode-batch", type=int, default=8)
     parser.add_argument("--seed", type=int, default=20261008)
     args = parser.parse_args()

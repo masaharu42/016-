@@ -63,6 +63,8 @@ class Round2Contract(unittest.TestCase):
         self.assertEqual(checked["boundary"], 0.5)
         self.assertEqual(checked["ssim"], 0.0)
         self.assertEqual(checked["descriptor"], 0.0)
+        self.assertEqual(checked["grain_coherence"], 0.1)
+        self.assertEqual(train_round2.LOSS_GRAIN_COHERENCE, 0.1)
         for ssim_weight, descriptor_weight in ((0.25, 0.25), (0.1, 0.1), (0.1, 0.0), (0.0, 0.1), (0.0, 0.25)):
             rejected = dict(checked)
             rejected["ssim"] = ssim_weight
@@ -75,6 +77,11 @@ class Round2Contract(unittest.TestCase):
         with self.assertRaises(RuntimeError) as quarter_boundary:
             train_round2.check_structure_weights(old_boundary)
         self.assertIn("0.5", str(quarter_boundary.exception))
+        off_coherence = dict(checked)
+        off_coherence["grain_coherence"] = 0.0
+        with self.assertRaises(RuntimeError) as missing_coherence:
+            train_round2.check_structure_weights(off_coherence)
+        self.assertIn("0.1", str(missing_coherence.exception))
         with self.assertRaises(RuntimeError) as stale:
             train_round2.check_structure_weights({
                 "image": 1.0,
@@ -93,6 +100,7 @@ class Round2Contract(unittest.TestCase):
             "haar": 0.25,
             "ssim": 0.0,
             "descriptor": 0.0,
+            "grain_coherence": 0.1,
         })
         self.assertEqual(train_round2.LOSS_NOISE, 1.0)
         self.assertEqual(train_round2.MECHANICS_LOSS_WEIGHT, 0.0)
@@ -115,13 +123,17 @@ class Round2Contract(unittest.TestCase):
             "ssim_loss(decoded[:, :3], target[:, :3])",
             inspect.getsource(train_round2.image_structure_losses),
         )
+        self.assertIn(
+            "grain_coherence_loss(decoded, target)",
+            inspect.getsource(train_round2.image_structure_losses),
+        )
 
     def test_structure_total_is_noise_plus_four_terms(self):
         decoded = torch.rand(2, 4, 32, 32, requires_grad=True)
         target = torch.rand(2, 4, 32, 32)
         parts = train_round2.image_structure_losses(decoded, target)
         parts["descriptor"] = decoded.sum() * 0.0
-        self.assertEqual(set(parts), {"image", "edge", "boundary", "haar", "ssim", "descriptor"})
+        self.assertEqual(set(parts), set(train_round2.STRUCTURE_TERM_KEYS))
         noise = torch.tensor(0.3)
         total = train_round2.diffusion_structure_total(noise, parts)
         expected = (
@@ -132,11 +144,35 @@ class Round2Contract(unittest.TestCase):
             + 0.25 * parts["haar"]
             + 0.0 * parts["ssim"]
             + 0.0 * parts["descriptor"]
+            + 0.1 * parts["grain_coherence"]
         )
         self.assertTrue(torch.allclose(total, expected))
         self.assertTrue(torch.isfinite(total))
         total.backward()
         self.assertGreater(float(decoded.grad.abs().sum()), 0.0)
+
+    def test_grain_coherence_penalizes_interior_color_variance(self):
+        interior = torch.zeros(1, 4, 32, 32)
+        interior[:, 3] = 1.0
+        flat = interior.clone()
+        speckled = interior.clone()
+        speckled[:, 0, :, ::2] = 1.0
+        speckled[:, 0, :, 1::2] = -1.0
+        boundary_target = torch.zeros(1, 4, 32, 32)
+        boundary_target[:, 3] = -1.0
+        flat_loss = train_round2.grain_coherence_loss(flat, interior)
+        speckle_loss = train_round2.grain_coherence_loss(speckled, interior)
+        masked_loss = train_round2.grain_coherence_loss(speckled, boundary_target)
+        self.assertLess(float(flat_loss), 1e-5)
+        self.assertGreater(float(speckle_loss), 0.05)
+        self.assertLess(float(masked_loss), float(speckle_loss) * 0.05)
+        prediction = speckled.detach().clone().requires_grad_(True)
+        train_round2.grain_coherence_loss(prediction, interior).backward()
+        self.assertGreater(float(prediction.grad[:, :3].abs().sum()), 0.0)
+        self.assertEqual(float(prediction.grad[:, 3].abs().sum()), 0.0)
+        sample = (ROOT / "sample_id03.py").read_text(encoding="utf-8")
+        self.assertIn('"--guidance"', sample)
+        self.assertIn("GUIDANCE_SCALE = 2.0", sample)
 
     def test_frozen_vae_decode_passes_latent_grad_not_parameter_grad(self):
         vae = BoundaryAwareVAE(base_channels=8, channel_multipliers=(1, 2), latent_channels=4).eval()
@@ -188,10 +224,11 @@ class Round2Contract(unittest.TestCase):
         self.assertTrue(train_round2.should_rewrite_loss_log(1152, True))
         self.assertFalse(train_round2.should_rewrite_loss_log(1600, True))
         self.assertTrue(train_round2.should_rewrite_loss_log(1600, False))
-        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_晶界0.5_无ssim无描述符.csv")
+        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_晶界0.5_晶粒均匀0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_ssim描述符_权重0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_无ssim无描述符.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_无ssim_描述符0.1.csv")
+        self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_晶界0.5_无ssim无描述符.csv")
         self.assertIn("structure_weights=", inspect.getsource(train_round2.main))
         self.assertIn("ID03抽查_epoch1152", train_round2.RESERVED_SAMPLE_DIRS)
         train_round2.check_batch_size(16)
@@ -213,6 +250,7 @@ class Round2Contract(unittest.TestCase):
                 "loss_haar": "0.1",
                 "loss_ssim": "0.4",
                 "loss_descriptor": "0.2",
+                "loss_grain_coherence": "0.08",
             },
             {
                 "loss_total": "0.5",
@@ -223,6 +261,7 @@ class Round2Contract(unittest.TestCase):
                 "loss_haar": "0.1",
                 "loss_ssim": "0.2",
                 "loss_descriptor": "0.0",
+                "loss_grain_coherence": "0.02",
             },
         ]
         line = train_round2.format_epoch_line(201, rows, "0.12345678")
@@ -230,7 +269,7 @@ class Round2Contract(unittest.TestCase):
             line,
             "epoch 201 train_total 1.0000 noise 0.1000 image 0.3000 "
             "edge 0.2000 boundary 0.1000 haar 0.1000 ssim 0.3000 "
-            "descriptor 0.1000 val_noise 0.12345678",
+            "descriptor 0.1000 grain_coherence 0.0500 val_noise 0.12345678",
         )
         main = inspect.getsource(train_round2.main)
         self.assertIn("enable_live_stdout()", main)
@@ -310,7 +349,7 @@ print(_image_mode())
         noise = torch.tensor(0.4)
         quiet_total = train_round2.diffusion_structure_total(noise, quiet_parts)
         self.assertTrue(torch.allclose(quiet_total, noise))
-        for name in ("image", "edge", "boundary", "haar", "ssim"):
+        for name in ("image", "edge", "boundary", "haar", "ssim", "grain_coherence"):
             self.assertEqual(float(quiet_parts[name].detach()), 0.0)
 
     def test_pixel_target_is_original_window(self):
