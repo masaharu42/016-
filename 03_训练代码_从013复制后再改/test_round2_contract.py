@@ -622,7 +622,22 @@ print(_image_mode())
         alloy_row["desc_cond_grain_size_log_spread"] = "0.8"
         holdout = window_condition.holdout_condition(alloy_row, 4)
         self.assertEqual(tuple(holdout.shape), (4, 34))
-        self.assertEqual(window_condition.HOLDOUT_SAMPLE_ORIGINS, ((0, 0), (64, 0), (0, 48), (64, 48)))
+        origins = window_condition.HOLDOUT_SAMPLE_ORIGINS
+        self.assertGreaterEqual(len(origins), 20)
+        self.assertEqual(len(origins), len(set(origins)))
+        self.assertEqual(origins[:4], ((0, 0), (64, 0), (0, 48), (64, 48)))
+        for origin_x, origin_y in origins:
+            self.assertTrue(0 <= origin_x <= 128 and origin_x % 16 == 0)
+            self.assertTrue(0 <= origin_y <= 48 and origin_y % 16 == 0)
+            self.assertLessEqual(origin_x + 64, 192)
+            self.assertLessEqual(origin_y + 64, 112)
+        twenty = window_condition.holdout_origins(20)
+        self.assertEqual(len(twenty), 20)
+        self.assertEqual(len(set(twenty)), 20)
+        self.assertIn((0, 0), twenty)
+        self.assertIn((128, 48), twenty)
+        wrapped = window_condition.holdout_origins(len(origins) + 1)
+        self.assertEqual(wrapped[-1], origins[0])
         self.assertTrue(torch.allclose(holdout[:, 28:30], torch.tensor([
             [0.0, 0.0],
             [0.5, 0.0],
@@ -634,8 +649,23 @@ print(_image_mode())
         self.assertTrue(torch.equal(absent, torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])))
         sample = (ROOT / "sample_id03.py").read_text(encoding="utf-8")
         self.assertIn("holdout_condition", sample)
+        self.assertIn("holdout_origins", sample)
         self.assertIn("batch_condition", sample)
         self.assertNotIn("ID03.png", sample)
+        with unittest.mock.patch.object(sys, "argv", [
+            "sample_id03.py",
+            "--mode", "sample",
+            "--checkpoint", "ckpt.pt",
+            "--count", "20",
+            "--seed", "7",
+            "--out-dir", "somewhere",
+        ]):
+            import sample_id03
+            parsed = sample_id03.parse_args()
+        self.assertEqual(parsed.count, 20)
+        self.assertEqual(parsed.seed, 7)
+        self.assertEqual(parsed.checkpoint, Path("ckpt.pt"))
+        self.assertEqual(parsed.out_dir, Path("somewhere"))
 
     def test_expanded_condition_layer_keeps_old_columns_at_zero_init(self):
         saved = torch.arange(8 * 4, dtype=torch.float32).reshape(8, 4)

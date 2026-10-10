@@ -64,4 +64,6 @@ python "03_训练代码_从013复制后再改/sample_id03.py" --mode sample --ch
 
 python "03_训练代码_从013复制后再改/sample_id03.py" --mode sample --checkpoint "04_训练日志/checkpoint_epoch1152.pt" --guidance 3.0 --out-dir "04_训练日志/ID03抽查_epoch1152_guidance3.0"
 
-这一轮训完之后的断点是 34 维。sample_id03.py 按条件层宽度自己选：28 维仍只用合金条件；34 维用训练区四个角 (latent_x, latent_y) = (0, 0)、(64, 0)、(0, 48)、(64, 48)。窗口 D50 和 log_spread 用 conditions_ID03_holdout.csv 里的 desc_cond_grain_size_median_um 和 desc_cond_grain_size_log_spread，不是某个窗口的实测，也不读 ID03 的图。背图检查遇到 34 维断点时，会把抽中的窗口位置和描述符接到合金条件后面。
+这一轮训完之后的断点是 34 维。sample_id03.py 按条件层宽度自己选：28 维仍只用合金条件；34 维用合法窗口原点，latent_x 从 0 到 128、步长 16，latent_y 从 0 到 48、步长 16，共 36 个不重复位置。前四个仍是 (0, 0)、(64, 0)、(0, 48)、(64, 48)。--count 20 取前 20 个，覆盖左右和上下。--count 大于 36 时从头循环。窗口 D50 和 log_spread 用 conditions_ID03_holdout.csv 里的 desc_cond_grain_size_median_um 和 desc_cond_grain_size_log_spread，不是某个窗口的实测，也不读 ID03 的图。背图检查遇到 34 维断点时，会把抽中的窗口位置和描述符接到合金条件后面。抽样命令已有 --checkpoint、--count、--seed、--out-dir。28 维断点的 --count 20 会写出 20 张图，条件仍是同一条合金向量。34 维断点才会把上面 36 个原点写进条件，前 20 个互不重复。比 20 张：
+
+python "03_训练代码_从013复制后再改/sample_id03.py" --mode sample --checkpoint "04_训练日志/checkpoint_epoch1152.pt" --count 20 --seed 20261008 --out-dir "04_训练日志/ID03抽查_epoch1152_20"

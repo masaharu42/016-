@@ -28,7 +28,7 @@ from train_round1 import (
     project_root,
     read_table,
 )
-from window_condition import CONDITION_DIM, HOLDOUT_SAMPLE_ORIGINS, batch_condition, holdout_condition
+from window_condition import CONDITION_DIM, batch_condition, holdout_condition, holdout_origins
 
 CORR_NEAR_ONE = 0.98
 GUIDANCE_SCALE = 2.0
@@ -116,8 +116,9 @@ def sample_id03(args, device) -> None:
     )
     if int(model.condition_encoder.input_mean.numel()) == CONDITION_DIM:
         condition = holdout_condition(rows[0], args.count).to(device)
+        origins = holdout_origins(args.count)
         print(
-            f"id03_window_origins={list(HOLDOUT_SAMPLE_ORIGINS[:args.count])} "
+            f"id03_window_origins={origins} "
             f"window_d50=desc_cond_grain_size_median_um condition_dim={CONDITION_DIM}",
             flush=True,
         )
@@ -146,9 +147,9 @@ def sample_id03(args, device) -> None:
         "condition_dim": int(condition.shape[1]),
         "window_origins": [
             {"latent_x": origin_x, "latent_y": origin_y}
-            for origin_x, origin_y in list(HOLDOUT_SAMPLE_ORIGINS)[:args.count]
+            for origin_x, origin_y in holdout_origins(args.count)
         ] if int(condition.shape[1]) == CONDITION_DIM else [],
-        "note": "只用于最后看 ID03。不参与做清单，也不拿来调参。没有读取 ID03 的原图。34 维条件时窗口位置是训练区四个角，D50 和 log_spread 用留出合金条件里的描述符，不是窗口实测。",
+        "note": "只用于最后看 ID03。不参与做清单，也不拿来调参。没有读取 ID03 的原图。34 维条件时窗口位置是 latent_x 0..128、latent_y 0..48、步长 16 的合法原点，--count 20 取前 20 个不重复位置，超过清单长度再从头循环。D50 和 log_spread 用留出合金条件里的描述符，不是窗口实测。",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"wrote {args.count} windows to {args.out_dir}", flush=True)
 

@@ -25,8 +25,33 @@ WINDOW_FEATURE_NAMES = (
     "window_log_spread_present",
 )
 CONDITION_DIM = ALLOY_CONDITION_DIM + len(WINDOW_FEATURE_NAMES)
-# Four corners of the legal training region. ID03 has no crop table.
-HOLDOUT_SAMPLE_ORIGINS = ((0, 0), (64, 0), (0, 48), (64, 48))
+# A 64 window fits a 112×192 landscape latent at x 0..128 and y 0..48.
+# Step 16 gives 9×4 = 36 distinct origins. The first 20 are a coarser
+# spread (x every 32, every y), with the four corners listed first.
+_HOLDOUT_X = tuple(range(0, 129, 16))
+_HOLDOUT_Y = tuple(range(0, 49, 16))
+_HOLDOUT_CORNERS = ((0, 0), (64, 0), (0, 48), (64, 48))
+_HOLDOUT_SPREAD_X = (0, 32, 64, 96, 128)
+
+
+def _build_holdout_origins() -> tuple[tuple[int, int], ...]:
+    spread = [(x, y) for x in _HOLDOUT_SPREAD_X for y in _HOLDOUT_Y]
+    first = list(_HOLDOUT_CORNERS) + [origin for origin in spread if origin not in _HOLDOUT_CORNERS]
+    rest = [(x, y) for x in _HOLDOUT_X for y in _HOLDOUT_Y if (x, y) not in first]
+    origins = tuple(first + rest)
+    if len(origins) < 20 or len(set(origins)) != len(origins):
+        raise RuntimeError(f"ID03 抽样位置不够或有重复: {len(origins)}")
+    return origins
+
+
+HOLDOUT_SAMPLE_ORIGINS = _build_holdout_origins()
+
+
+def holdout_origins(count: int) -> list[tuple[int, int]]:
+    """First `count` sample origins. Past the list, cycle from the start."""
+    if count < 1:
+        raise RuntimeError("ID03 抽样数量至少是 1")
+    return [HOLDOUT_SAMPLE_ORIGINS[index % len(HOLDOUT_SAMPLE_ORIGINS)] for index in range(count)]
 
 
 def finite_field(text: object) -> tuple[float, float]:
@@ -94,19 +119,16 @@ def batch_condition(rows: list[dict[str, str]], alloy_by_id: dict[str, torch.Ten
 
 
 def holdout_condition(alloy_row: dict[str, str], count: int) -> torch.Tensor:
-    """ID03 samples. Positions are the training-region corners.
+    """ID03 samples. Positions are the step-16 latent origins.
 
     Window D50 and log_spread are the alloy condition fields already in the
     holdout csv. ID03 images are not read, and crops.csv has no ID03 rows.
     A missing alloy descriptor stays masked at 0.
     """
-    if count < 1:
-        raise RuntimeError("ID03 抽样数量至少是 1")
     alloy = torch.tensor([float(alloy_row[name]) for name in COND_COLUMNS], dtype=torch.float32)
     alloy_id = alloy_row.get("alloy_id", "ID03")
     rows = []
-    for index in range(count):
-        origin_x, origin_y = HOLDOUT_SAMPLE_ORIGINS[index % len(HOLDOUT_SAMPLE_ORIGINS)]
+    for origin_x, origin_y in holdout_origins(count):
         rows.append({
             "alloy_id": alloy_id,
             "latent_x": str(origin_x),
