@@ -193,7 +193,10 @@ def epoch_order(groups: dict[str, list[int]], rng: np.random.Generator, batch_si
     if len(order) != N_ALLOYS * DRAWS_PER_ALLOY:
         raise RuntimeError(f"一轮应有 {N_ALLOYS * DRAWS_PER_ALLOY} 条，实际 {len(order)}")
     if len(order) % batch_size != 0:
-        raise RuntimeError(f"{len(order)} 不能被 batch {batch_size} 整除。16 或 8 可以。")
+        raise RuntimeError(
+            f"{len(order)} 不能被 batch {batch_size} 整除。"
+            "336 条一轮时，8、16、24、28、42、48、56 可以。"
+        )
     return order
 
 

@@ -28,7 +28,13 @@ from train_round1 import (
     project_root,
     read_table,
 )
-from window_condition import CONDITION_DIM, batch_condition, holdout_condition, holdout_origins
+from window_condition import (
+    CONDITION_DIM,
+    WINDOW_FEATURE_NAMES,
+    batch_condition,
+    holdout_condition,
+    holdout_origins,
+)
 
 CORR_NEAR_ONE = 0.98
 GUIDANCE_SCALE = 2.0
@@ -50,6 +56,11 @@ def load_unet(checkpoint: Path, device: torch.device):
     state = torch.load(checkpoint, map_location="cpu", weights_only=False)
     weight = state["model"]["condition_encoder.network.0.weight"]
     condition_dim = int(weight.shape[1])
+    if condition_dim == 34:
+        raise RuntimeError(
+            "断点是上一阶段的 34 维窗口条件。这一轮条件是 50 维，请用从第 0 轮新训的断点。"
+            "28 维的旧断点仍只重复合金条件。"
+        )
     if condition_dim not in (len(COND_COLUMNS), CONDITION_DIM):
         raise RuntimeError(f"断点条件维度 {condition_dim} 不是 {len(COND_COLUMNS)} 也不是 {CONDITION_DIM}")
     model = ConditionalLatentUNet(
@@ -118,8 +129,9 @@ def sample_id03(args, device) -> None:
         condition = holdout_condition(rows[0], args.count).to(device)
         origins = holdout_origins(args.count)
         print(
-            f"id03_window_origins={origins} "
-            f"window_d50=desc_cond_grain_size_median_um condition_dim={CONDITION_DIM}",
+            f"id03_window_origins={origins} condition_dim={CONDITION_DIM} "
+            f"window_features={list(WINDOW_FEATURE_NAMES)} "
+            f"holdout_window_and_global=desc_cond_*",
             flush=True,
         )
     else:
@@ -149,7 +161,7 @@ def sample_id03(args, device) -> None:
             {"latent_x": origin_x, "latent_y": origin_y}
             for origin_x, origin_y in holdout_origins(args.count)
         ] if int(condition.shape[1]) == CONDITION_DIM else [],
-        "note": "只用于最后看 ID03。不参与做清单，也不拿来调参。没有读取 ID03 的原图。34 维条件时窗口位置是 latent_x 0..128、latent_y 0..48、步长 16 的合法原点，--count 20 取前 20 个不重复位置，超过清单长度再从头循环。D50 和 log_spread 用留出合金条件里的描述符，不是窗口实测。",
+        "note": "只用于最后看 ID03。不参与做清单，也不拿来调参。没有读取 ID03 的原图。50 维条件时窗口位置是 latent_x 0..128、latent_y 0..48、步长 16 的合法原点，--count 20 取前 20 个不重复位置，超过清单长度再从头循环。窗级五维和整图五维都用留出合金条件里的 desc_cond_*，不是窗口实测，也不加 Δ。guidance 默认 2.0。",
     }, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"wrote {args.count} windows to {args.out_dir}", flush=True)
 

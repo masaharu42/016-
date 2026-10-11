@@ -58,21 +58,28 @@ class Round2Contract(unittest.TestCase):
         self.assertEqual(train_round2.LOSS_HAAR, float(source.haar))
         self.assertEqual(train_round2.LOSS_SSIM, 0.0)
         self.assertNotEqual(train_round2.LOSS_SSIM, float(source.ssim))
-        self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.0)
+        self.assertEqual(train_round2.DESCRIPTOR_LOSS_WEIGHT, 0.1)
+        self.assertEqual(train_round2.LOSS_DESCRIPTOR, 0.1)
         self.assertEqual(list(train_round2.structure_loss_weights()), list(train_round2.STRUCTURE_TERM_KEYS))
         checked = train_round2.check_structure_weights()
         self.assertEqual(checked["boundary"], 0.5)
         self.assertEqual(checked["ssim"], 0.0)
-        self.assertEqual(checked["descriptor"], 0.0)
+        self.assertEqual(checked["descriptor"], 0.1)
         self.assertEqual(checked["grain_coherence"], 0.1)
         self.assertEqual(train_round2.LOSS_GRAIN_COHERENCE, 0.1)
-        for ssim_weight, descriptor_weight in ((0.25, 0.25), (0.1, 0.1), (0.1, 0.0), (0.0, 0.1), (0.0, 0.25)):
+        train_round2.assert_startup_constraints()
+        for ssim_weight in (0.25, 0.1):
             rejected = dict(checked)
             rejected["ssim"] = ssim_weight
-            rejected["descriptor"] = descriptor_weight
-            with self.assertRaises(RuntimeError) as still_on:
+            with self.assertRaises(RuntimeError) as ssim_on:
                 train_round2.check_structure_weights(rejected)
-            self.assertIn("必须是 0", str(still_on.exception))
+            self.assertIn("SSIM 权重必须是 0", str(ssim_on.exception))
+        for descriptor_weight in (0.0, 0.25, 0.2):
+            rejected = dict(checked)
+            rejected["descriptor"] = descriptor_weight
+            with self.assertRaises(RuntimeError) as descriptor_off:
+                train_round2.check_structure_weights(rejected)
+            self.assertIn("描述符权重必须是 0.1", str(descriptor_off.exception))
         old_boundary = dict(checked)
         old_boundary["boundary"] = 0.25
         with self.assertRaises(RuntimeError) as quarter_boundary:
@@ -100,7 +107,7 @@ class Round2Contract(unittest.TestCase):
             "boundary": 0.5,
             "haar": 0.25,
             "ssim": 0.0,
-            "descriptor": 0.0,
+            "descriptor": 0.1,
             "grain_coherence": 0.1,
         })
         self.assertEqual(train_round2.LOSS_NOISE, 1.0)
@@ -144,7 +151,7 @@ class Round2Contract(unittest.TestCase):
             + 0.5 * parts["boundary"]
             + 0.25 * parts["haar"]
             + 0.0 * parts["ssim"]
-            + 0.0 * parts["descriptor"]
+            + 0.1 * parts["descriptor"]
             + 0.1 * parts["grain_coherence"]
         )
         self.assertTrue(torch.allclose(total, expected))
@@ -187,46 +194,50 @@ class Round2Contract(unittest.TestCase):
         self.assertGreater(float(latent.grad.abs().sum()), 0.0)
         self.assertTrue(all(parameter.grad is None for parameter in vae.parameters()))
 
-    def test_epoch_cap_resumes_only_from_round1(self):
+    def test_epoch_cap_starts_from_scratch(self):
         self.assertEqual(train_round2.TARGET_OPTIMIZER_STEPS, 20000)
         self.assertEqual(train_round2.UNUSED_LONG_RUN_STEPS, 80000)
+        self.assertEqual(train_round2.SCRATCH_START_EPOCH, 0)
+        self.assertEqual(train_round2.RECOMMENDED_BATCH_SIZE_32GB, 48)
+        self.assertEqual(train_round2.FALLBACK_BATCH_SIZE_32GB, 24)
+        self.assertEqual(train_round2.PREFETCH_WORKERS, 8)
+        self.assertEqual(train_round2.optimizer_steps_per_epoch(48), 7)
+        self.assertEqual(train_round2.optimizer_steps_per_epoch(24), 14)
         self.assertEqual(train_round2.optimizer_steps_per_epoch(16), 21)
         self.assertEqual(train_round2.optimizer_steps_per_epoch(8), 42)
+        self.assertEqual(train_round2.default_extra_epochs(48), 2857)
+        self.assertEqual(train_round2.default_extra_epochs(24), 1428)
         self.assertEqual(train_round2.default_extra_epochs(16), 952)
-        self.assertEqual(train_round2.default_extra_epochs(8), 476)
-        self.assertEqual(952 * 21, 19992)
-        self.assertEqual(476 * 42, 19992)
-        self.assertLessEqual(952 * 21, 20000)
-        self.assertLessEqual(476 * 42, 20000)
-        self.assertGreater(953 * 21, 20000)
-        self.assertGreater(477 * 42, 20000)
-        self.assertEqual(train_round2.resolve_epoch_range(1152, 952, 16), (1152, 2104))
-        self.assertEqual(train_round2.resolve_epoch_range(1152, 476, 8), (1152, 1628))
-        self.assertEqual(train_round2.resolve_epoch_range(200, 952, 16), (200, 1152))
-        self.assertEqual(train_round2.resolve_epoch_range(250, 1, 16), (250, 251))
-        train_round2.assert_round1_checkpoint(Path("checkpoint_epoch1152.pt"), 1152)
-        train_round2.assert_round1_checkpoint(Path("checkpoint_epoch200.pt"), 200)
-        train_round2.assert_round1_checkpoint(Path("checkpoint_epoch250.pt"), 250)
-        for start in (400, 600):
+        self.assertEqual(2857 * 7, 19999)
+        self.assertEqual(1428 * 14, 19992)
+        self.assertLessEqual(2857 * 7, 20000)
+        self.assertGreater(2858 * 7, 20000)
+        self.assertEqual(train_round2.resolve_epoch_range(0, 2857, 48), (0, 2857))
+        self.assertEqual(train_round2.resolve_epoch_range(0, 1, 48), (0, 1))
+        train_round2.assert_scratch_entrypoint(None)
+        for name in (
+            "checkpoint_epoch1152.pt",
+            "checkpoint_epoch400.pt",
+            "checkpoint_epoch600.pt",
+            "checkpoint_epoch200.pt",
+        ):
             with self.assertRaises(RuntimeError):
-                train_round2.resolve_epoch_range(start, 1, 16)
+                train_round2.assert_scratch_entrypoint(Path(name))
+        for start in (1152, 400, 600, 200, 1):
+            with self.assertRaises(RuntimeError):
+                train_round2.resolve_epoch_range(start, 1, 48)
         with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(200, 953, 16)
+            train_round2.resolve_epoch_range(0, 2858, 48)
         with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(200, 477, 8)
+            train_round2.resolve_epoch_range(0, 80000, 16)
         with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(200, 80000, 16)
-        with self.assertRaises(RuntimeError):
-            train_round2.resolve_epoch_range(200, 0, 16)
-        with self.assertRaises(RuntimeError):
-            train_round2.assert_round1_checkpoint(Path("checkpoint_epoch400.pt"), 400)
-        with self.assertRaises(RuntimeError):
-            train_round2.assert_round1_checkpoint(Path("checkpoint_epoch600.pt"), 600)
-        self.assertTrue(train_round2.should_rewrite_loss_log(1152, True))
-        self.assertFalse(train_round2.should_rewrite_loss_log(1600, True))
-        self.assertTrue(train_round2.should_rewrite_loss_log(1600, False))
-        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_窗口条件_晶界0.5_晶粒均匀0.1.csv")
-        self.assertEqual(train_round2.CONFIG_NAME, "第二轮窗口条件_晶界0.5_晶粒均匀0.1配置.json")
+            train_round2.resolve_epoch_range(0, 0, 48)
+        self.assertTrue(train_round2.should_rewrite_loss_log(0, True))
+        self.assertFalse(train_round2.should_rewrite_loss_log(50, True))
+        self.assertTrue(train_round2.should_rewrite_loss_log(50, False))
+        self.assertEqual(train_round2.LOSS_LOG_NAME, "train_round2_从零_50D窗加整图条件_描述符0.1.csv")
+        self.assertEqual(train_round2.CONFIG_NAME, "第二轮从零_50D窗加整图条件_描述符0.1配置.json")
+        self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_窗口条件_晶界0.5_晶粒均匀0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_晶界0.5_晶粒均匀0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_ssim描述符_权重0.1.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_无ssim无描述符.csv")
@@ -235,11 +246,18 @@ class Round2Contract(unittest.TestCase):
         main_source = inspect.getsource(train_round2.main)
         self.assertIn("structure_weights=", main_source)
         self.assertIn("condition_dim=", main_source)
+        self.assertIn("window_features=", main_source)
+        self.assertIn("assert_startup_constraints()", main_source)
+        self.assertIn("assert_scratch_entrypoint", main_source)
+        self.assertNotIn("load_expanded_model", main_source)
+        self.assertNotIn("_load_checkpoint", main_source)
         self.assertIn("window_feature_statistics", main_source)
-        self.assertIn("load_expanded_model", main_source)
         self.assertIn("batch_condition", inspect.getsource(train_round2._optimizer_step))
+        self.assertIn("load_original_batch", inspect.getsource(train_round2._optimizer_step))
         self.assertIn("batch_condition", inspect.getsource(train_round2._val_noise_window))
         self.assertIn("ID03抽查_epoch1152", train_round2.RESERVED_SAMPLE_DIRS)
+        train_round2.check_batch_size(48)
+        train_round2.check_batch_size(24)
         train_round2.check_batch_size(16)
         train_round2.check_batch_size(8)
         with self.assertRaises(RuntimeError):
@@ -375,7 +393,7 @@ print(_image_mode())
         self.assertIn("image_to_tensor", loader)
         self.assertIn("Image.open", loader)
         main = inspect.getsource(train_round2.main)
-        self.assertIn("assert_round1_checkpoint", main)
+        self.assertIn("assert_scratch_entrypoint", main)
         self.assertNotIn("train_round2_loss.csv", main)
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_loss.csv")
         self.assertNotEqual(train_round2.LOSS_LOG_NAME, "train_round2_原图低噪声.csv")
@@ -449,11 +467,15 @@ print(_image_mode())
         self.assertLess(smoke_at, sample_at)
         self.assertIn("return", main[smoke_at:sample_at])
 
-    def test_checkpoint_argument_is_required(self):
+    def test_checkpoint_argument_is_refused(self):
         parser_source = inspect.getsource(train_round2.parse_args)
-        self.assertIn("required=True", parser_source)
-        self.assertNotIn("checkpoint_epoch200.pt", parser_source.split("help=")[0])
-        self.assertNotIn("checkpoint_epoch400.pt", parser_source.split("help=")[0])
+        self.assertNotIn("required=True", parser_source)
+        self.assertIn('default=RECOMMENDED_BATCH_SIZE_32GB', parser_source)
+        self.assertIn("default=PREFETCH_WORKERS", parser_source)
+        self.assertIn("checkpoint_epoch1152.pt", parser_source)
+        self.assertIn("--loss-descriptor", parser_source)
+        self.assertIn("default=None", parser_source)
+        self.assertNotIn("MAX_EXTRA_EPOCHS", (ROOT / "train_round2.py").read_text(encoding="utf-8"))
 
     def test_descriptor_uses_window_values_and_requires_matching_proxy(self):
         rows = [
@@ -576,8 +598,16 @@ print(_image_mode())
 
     def test_window_condition_appends_position_and_masks_empty_fields(self):
         self.assertEqual(window_condition.ALLOY_CONDITION_DIM, 28)
-        self.assertEqual(window_condition.CONDITION_DIM, 34)
-        self.assertEqual(train_round2.CONDITION_DIM, 34)
+        self.assertEqual(window_condition.CONDITION_DIM, 50)
+        self.assertEqual(train_round2.CONDITION_DIM, 50)
+        self.assertEqual(len(window_condition.WINDOW_FEATURE_NAMES), 22)
+        names = ["window_x", "window_y"]
+        for desc in ("D50", "log_spread", "area_weighted_aspect", "coarse_area_fraction", "boundary_length_density"):
+            names.extend((f"window_{desc}", f"window_{desc}_present"))
+        for desc in ("D50", "log_spread", "area_weighted_aspect", "coarse_area_fraction", "boundary_length_density"):
+            names.extend((f"global_{desc}", f"global_{desc}_present"))
+        self.assertEqual(list(window_condition.WINDOW_FEATURE_NAMES), names)
+        self.assertFalse(any("delta" in name.lower() or "Δ" in name for name in names))
         self.assertEqual(window_condition.finite_field(None), (0.0, 0.0))
         self.assertEqual(window_condition.finite_field(""), (0.0, 0.0))
         self.assertEqual(window_condition.finite_field("  "), (0.0, 0.0))
@@ -592,7 +622,9 @@ print(_image_mode())
             "log_spread": "nan",
         }
         features = window_condition.window_features(empty)
-        self.assertTrue(torch.equal(features, torch.tensor([0.5, 1.0, 0.0, 0.0, 0.0, 0.0])))
+        self.assertEqual(tuple(features.shape), (22,))
+        self.assertTrue(torch.equal(features[:2], torch.tensor([0.5, 1.0])))
+        self.assertTrue(torch.equal(features[2:], torch.zeros(20)))
         filled = {"latent_x": "0", "latent_y": "0", "D50": "5.5", "log_spread": "0.2"}
         alloy = torch.arange(28, dtype=torch.float32)
         batch = window_condition.batch_condition(
@@ -602,7 +634,7 @@ print(_image_mode())
             ],
             {"ID01": alloy},
         )
-        self.assertEqual(tuple(batch.shape), (2, 34))
+        self.assertEqual(tuple(batch.shape), (2, 50))
         self.assertTrue(torch.equal(batch[:, :28], alloy.repeat(2, 1)))
         self.assertEqual(float(batch[1, 30]), 5.5)
         self.assertEqual(float(batch[1, 31]), 1.0)
@@ -612,7 +644,7 @@ print(_image_mode())
             {"latent_x": "32", "latent_y": "16", "D50": "6.5", "log_spread": "0.4"},
             {"latent_x": "16", "latent_y": "0"},
         ])
-        self.assertEqual(tuple(mean.shape), (6,))
+        self.assertEqual(tuple(mean.shape), (22,))
         self.assertTrue(torch.allclose(mean[2], torch.tensor(6.0)))
         self.assertGreater(float(std[2]), 0.0)
         self.assertEqual(float(mean[3]), 0.5)
@@ -621,7 +653,7 @@ print(_image_mode())
         alloy_row["desc_cond_grain_size_median_um"] = "16.5"
         alloy_row["desc_cond_grain_size_log_spread"] = "0.8"
         holdout = window_condition.holdout_condition(alloy_row, 4)
-        self.assertEqual(tuple(holdout.shape), (4, 34))
+        self.assertEqual(tuple(holdout.shape), (4, 50))
         origins = window_condition.HOLDOUT_SAMPLE_ORIGINS
         self.assertGreaterEqual(len(origins), 20)
         self.assertEqual(len(origins), len(set(origins)))
@@ -645,8 +677,25 @@ print(_image_mode())
             [0.5, 1.0],
         ])))
         self.assertTrue(torch.allclose(holdout[:, 30:34], torch.tensor([16.5, 1.0, 0.8, 1.0]).repeat(4, 1)))
+        self.assertTrue(torch.allclose(holdout[:, 34:40], torch.tensor([0.1, 1.0, 0.1, 1.0, 0.1, 1.0]).repeat(4, 1)))
+        self.assertTrue(torch.allclose(holdout[:, 40:50], holdout[:, 30:40]))
+        full = {name: "0" for name in train_round1.COND_COLUMNS}
+        full["alloy_id"] = "ID03"
+        full.update({
+            "desc_cond_grain_size_median_um": "11",
+            "desc_cond_grain_size_log_spread": "0.4",
+            "desc_cond_area_weighted_aspect_ratio": "1.7",
+            "desc_cond_coarse_grain_area_fraction": "0.9",
+            "desc_cond_boundary_length_density_per_um": "0.02",
+        })
+        packed = window_condition.holdout_condition(full, 1)
+        expected_block = torch.tensor([11.0, 1.0, 0.4, 1.0, 1.7, 1.0, 0.9, 1.0, 0.02, 1.0])
+        self.assertTrue(torch.allclose(packed[0, 30:40], expected_block))
+        self.assertTrue(torch.allclose(packed[0, 40:50], expected_block))
+        with self.assertRaises(RuntimeError):
+            window_condition.require_catalog_columns([{"D50": "1"}])
         absent = window_condition.window_features({"latent_x": "0", "latent_y": "0"})
-        self.assertTrue(torch.equal(absent, torch.tensor([0.0, 0.0, 0.0, 0.0, 0.0, 0.0])))
+        self.assertTrue(torch.equal(absent, torch.zeros(22)))
         sample = (ROOT / "sample_id03.py").read_text(encoding="utf-8")
         self.assertIn("holdout_condition", sample)
         self.assertIn("holdout_origins", sample)
@@ -726,6 +775,33 @@ print(_image_mode())
         self.assertEqual(tuple(wide_opt.state[wide.weight]["step"].shape), ())
         wide(torch.randn(2, 6)).sum().backward()
         wide_opt.step()
+
+    def test_prepare_crops_attaches_global_descriptors_and_backs_up(self):
+        import prepare_crops
+        row = prepare_crops.attach_global({"alloy_id": "ID01"}, [1.0, 2.0, 3.0, 4.0, 5.0])
+        self.assertEqual(row["global_D50"], 1.0)
+        self.assertEqual(row["global_log_spread"], 2.0)
+        self.assertEqual(row["global_area_weighted_aspect"], 3.0)
+        self.assertEqual(row["global_coarse_area_fraction"], 4.0)
+        self.assertEqual(row["global_boundary_length_density"], 5.0)
+        with self.assertRaises(RuntimeError):
+            prepare_crops.attach_global({}, [1.0, 2.0])
+        source = (ROOT / "prepare_crops.py").read_text(encoding="utf-8")
+        self.assertIn("desc_parent(lab, table, 0, 0, full_h, full_w)", source)
+        self.assertIn("backup_if_missing_global", source)
+        self.assertIn('hold[["alloy_id", *COND_COLUMNS]]', source)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "crops.csv"
+            path.write_text("alloy_id,D50\nID01,1\n", encoding="utf-8")
+            prepare_crops.backup_if_missing_global(path)
+            backup = Path(tmp) / "crops_备份_无整图描述符.csv"
+            self.assertEqual(backup.read_text(encoding="utf-8"), path.read_text(encoding="utf-8"))
+            path.write_text("alloy_id,D50\nID01,9\n", encoding="utf-8")
+            prepare_crops.backup_if_missing_global(path)
+            self.assertIn("ID01,1", backup.read_text(encoding="utf-8"))
+            path.write_text("alloy_id,global_D50\nID01,1\n", encoding="utf-8")
+            prepare_crops.backup_if_missing_global(path)
+            self.assertIn("ID01,1", backup.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

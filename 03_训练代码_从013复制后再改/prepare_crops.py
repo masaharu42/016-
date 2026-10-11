@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -29,6 +30,30 @@ def _row(alloy_id, view, y, x, stats, trunc):
         row[name] = value
     row["truncation_ratio"] = trunc
     return row
+
+
+def attach_global(row: dict, global_stats) -> dict:
+    """Copy one full-view measurement onto a crop or val-strip row."""
+    if len(global_stats) != len(DESC_NAMES):
+        raise RuntimeError(f"整图描述符应为 {len(DESC_NAMES)} 个数，实际 {len(global_stats)}")
+    for name, value in zip(DESC_NAMES, global_stats):
+        row[f"global_{name}"] = value
+    return row
+
+
+def backup_if_missing_global(path: Path) -> None:
+    """Keep the pre-global catalog. A later rerun does not overwrite that backup."""
+    if not path.is_file():
+        return
+    with path.open(encoding="utf-8") as handle:
+        header = handle.readline()
+    if "global_D50" in header:
+        return
+    backup = path.with_name(f"{path.stem}_备份_无整图描述符{path.suffix}")
+    if backup.exists():
+        return
+    shutil.copy2(path, backup)
+    print(f"backed up {path.name} -> {backup.name}", flush=True)
 
 
 def main() -> None:
@@ -80,24 +105,29 @@ def main() -> None:
             if rgb_v.shape[0] != latent_h * 4 or rgb_v.shape[1] != latent_w * 4:
                 raise RuntimeError(f"{alloy_id} {view} image {rgb_v.shape} vs latent {shape}")
             lab, table, areas = segment(rgb_v)
-            cache[view] = (lab, table, areas, latent_h, latent_w)
+            # One absolute measurement of this view. Landscape training views
+            # are FULL_H x FULL_W (448 x 768). Portrait val strips are rotated,
+            # so the slice uses the view's own height and width.
+            full_h, full_w = int(rgb_v.shape[0]), int(rgb_v.shape[1])
+            global_stats = desc_parent(lab, table, 0, 0, full_h, full_w)
+            cache[view] = (lab, table, areas, global_stats)
             positions = training_positions(latent_h, latent_w) if meta["crop_eligible"] else []
             for y, x in positions:
                 pool.append((view, y, x))
             sy, sx = 0, latent_w - LATENT_WIN
             stats = desc_parent(lab, table, sy * 4, sx * 4, PIXEL_WIN, PIXEL_WIN)
             trunc = truncation_ratio(lab, areas, sy * 4, sx * 4, PIXEL_WIN, PIXEL_WIN)
-            strips.append(_row(alloy_id, view, sy, sx, stats, trunc))
+            strips.append(attach_global(_row(alloy_id, view, sy, sx, stats, trunc), global_stats))
         if len(pool) < 256:
             raise RuntimeError(f"{alloy_id} 合法窗口只有 {len(pool)} 个")
         rng = np.random.default_rng(child)
         pick = rng.choice(len(pool), size=256, replace=False)
         for k in pick.tolist():
             view, y, x = pool[k]
-            lab, table, areas, _, _ = cache[view]
+            lab, table, areas, global_stats = cache[view]
             stats = desc_parent(lab, table, y * 4, x * 4, PIXEL_WIN, PIXEL_WIN)
             trunc = truncation_ratio(lab, areas, y * 4, x * 4, PIXEL_WIN, PIXEL_WIN)
-            crops.append(_row(alloy_id, view, y, x, stats, trunc))
+            crops.append(attach_global(_row(alloy_id, view, y, x, stats, trunc), global_stats))
         rgb_i.close()
         mask_i.close()
         print(f"{alloy_id} pool={len(pool)} picked=256", flush=True)
@@ -110,9 +140,16 @@ def main() -> None:
     bad = crop_df[crop_df["latent_x"] + LATENT_WIN > 128]
     if len(bad):
         raise RuntimeError(f"训练窗口进入了右侧验证带: {len(bad)}")
-    crop_df.to_csv(args.out_dir / "crops.csv", index=False)
+    crops_path = args.out_dir / "crops.csv"
+    strip_path = args.out_dir / "val_strip.csv"
+    backup_if_missing_global(crops_path)
+    backup_if_missing_global(strip_path)
+    missing_global = [f"global_{name}" for name in DESC_NAMES if f"global_{name}" not in crop_df.columns]
+    if missing_global:
+        raise RuntimeError(f"crops 没有写入整图列: {missing_global}")
+    crop_df.to_csv(crops_path, index=False)
     strip_df = pd.DataFrame(strips).sort_values(["alloy_id", "view"]).reset_index(drop=True)
-    strip_df.to_csv(args.out_dir / "val_strip.csv", index=False)
+    strip_df.to_csv(strip_path, index=False)
     meta = {
         "seed": args.seed,
         "generator": "numpy.random.SeedSequence.spawn per alloy, then choice without replacement",
@@ -120,6 +157,7 @@ def main() -> None:
         "crop_rows": int(len(crop_df)),
         "val_strip_rows": int(len(strip_df)),
         "descriptors_are_model_inputs": False,
+        "global_descriptors": "desc_parent(lab, table, 0, 0, view_h, view_w) once per view, columns global_*. Absolute values, no delta. conditions.csv stays the 28 alloy columns.",
         "parent_grain": "centroid inside window, size is the full grain; area weights use in-window pixels; border is not a boundary",
         "right_strip": "latent_x = width-64, latent_y = 0, one 64x64 window per encoded view",
         "portrait_views_in_crops": False,
